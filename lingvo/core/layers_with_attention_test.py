@@ -568,6 +568,55 @@ class LayersWithAttentionTest(test_utils.TestCase):
       self.assertAllClose(expected_ctx, actual_ctx)
       self.assertAllClose(expected_probs, actual_probs)
 
+  def testTransformerAttentionLayerCase6(self):
+    with self.session(use_gpu=True) as sess:
+      depth = 4
+      p = layers_with_attention.TransformerAttentionLayer.Params()
+      p.name = 'transformer_atten'
+      p.source_dim = depth
+      p.is_masked = True
+      p.mask_type = 'ngram'
+      p.mask_ngram_order = 3
+      p.num_attention_heads = 2
+      transformer_atten = layers_with_attention.TransformerAttentionLayer(p)
+
+      (source_vecs, source_padding, _, _,
+       _) = self._testTransformerAttentionLayerInputs(depth=depth)
+      ctx, probs = transformer_atten.FPropDefaultTheta(source_vecs,
+                                                       source_padding)
+      tf.global_variables_initializer().run()
+      actual_ctx, actual_probs = sess.run([ctx, probs])
+      tf.logging.info(np.array_repr(actual_ctx))
+      tf.logging.info('actual_probs=%r', np.array_repr(actual_probs))
+      # pylint: disable=bad-whitespace
+      # pyformat: disable
+      expected_ctx = [
+          [[-0.14429152, 1.155101, 1.119303, -1.1924583],
+           [-0.6958059, -0.47006613, 0.8259231, 0.6959326]],
+          [[0.24164662, 0.5332843, -1.0211949, -1.4941208],
+           [-0.8260106, 0.024203, -1.1188016, 1.807844]],
+          [[1.7644346, -0.533464, -1.1461123, -1.4279743],
+           [-0.95326424, 0.39580172, 0.39262217, 0.6751373]],
+          [[-1.3441969, -2.3305228, 1.7523124, 0.15416345],
+           [1.4362367, 0.46009994, -1.4543657, -1.9060212]],
+          [[-0.8291472, 0.21259767, -0.9077787, 1.6243731],
+           [-1.0709695, 0.74920934, -0.5950014, 1.5919089]]]
+      expected_probs = [
+          [[1.        , 0.        , 0.        , 0.        , 0.        ],
+           [0.2       , 0.2       , 0.2       , 0.2       , 0.2       ]],
+          [[0.3966811 , 0.6033189 , 0.        , 0.        , 0.        ],
+           [0.        , 1.        , 0.        , 0.        , 0.        ]],
+          [[0.41050246, 0.5894975 , 0.        , 0.        , 0.        ],
+           [0.        , 0.5245893 , 0.4754107 , 0.        , 0.        ]],
+          [[0.        , 1.        , 0.        , 0.        , 0.        ],
+           [0.        , 0.31849146, 0.28174093, 0.39976764, 0.        ]],
+          [[0.        , 0.        , 0.        , 0.        , 1.        ],
+           [0.        , 0.        , 0.5881755 , 0.41182452, 0.        ]]]
+      # pyformat: enable
+      # pylint: enable=bad-whitespace
+      self.assertAllClose(expected_ctx, actual_ctx)
+      self.assertAllClose(expected_probs, actual_probs)
+
   def testTransformerLayerConstruction(self):
     p = layers_with_attention.TransformerLayer.Params()
     p.name = 'transformer_1'
@@ -625,6 +674,63 @@ class LayersWithAttentionTest(test_utils.TestCase):
            [ 3.14395714, -1.07060659,  0.27842081, -1.81273639]],
           [[ 1.39219522, -0.81882864, -0.32732445,  1.36851478],
            [-0.79119539, -0.28148842,  0.29963702,  1.37034667]]]
+      expected_prob_output = [
+          [[ 0.21795762,  0.,  0.26612395,  0.,  0.31251648, 0.,  0.20340192],
+           [ 0.,  0.2677784 ,  0.,  0.32895881,  0., 0.40326279,  0.]],
+          [[ 0.25721505,  0.,  0.24116731,  0.,  0.25138181, 0.,  0.2502358 ],
+           [ 0.,  0.25691482,  0.,  0.31076014,  0., 0.43232504,  0.]],
+          [[ 0.24550268,  0.,  0.25128055,  0.,  0.25109866, 0.,  0.25211811],
+           [ 0.,  0.26769161,  0.,  0.32481128,  0., 0.40749705,  0.]],
+          [[ 0.22675318,  0.,  0.26633731,  0.,  0.28919035, 0.,  0.21771915],
+           [ 0.,  0.35955882,  0.,  0.36869824,  0., 0.271743  ,  0.]],
+          [[ 0.21504655,  0.,  0.26958644,  0.,  0.30847484, 0.,  0.20689213],
+           [ 0.,  0.29516917,  0.,  0.29359812,  0., 0.41123265,  0.]]]
+      # pyformat: enable
+      # pylint: enable=bad-whitespace
+      self.assertAllClose(expected_layer_output, actual_layer_output)
+      self.assertAllClose(expected_prob_output, actual_prob_output)
+
+  def testTransformerLayerOutputLayerNormFProp(self):
+    """Test post-layernorm Fprop."""
+    with self.session(use_gpu=True) as sess:
+      np.random.seed(6348575)
+      depth = 4
+      p = layers_with_attention.TransformerLayer.Params()
+      p.name = 'transformer'
+      p.source_dim = depth
+      p.has_aux_atten = True
+      p.tr_post_ln_tpl = layers.LayerNorm.Params()
+      p.mask_self_atten = True
+      p.tr_fflayer_tpl.hidden_dim = 7
+      p.tr_atten_tpl.num_attention_heads = 2
+      transformer = layers_with_attention.TransformerLayer(p)
+
+      (source_vecs, source_padding, aux_vecs, aux_paddings,
+       _) = self._testTransformerAttentionLayerInputs(depth=depth)
+
+      h, probs = transformer.FPropDefaultTheta(
+          source_vecs,
+          source_padding,
+          aux_vecs=aux_vecs,
+          aux_paddings=aux_paddings)
+
+      tf.global_variables_initializer().run()
+      actual_layer_output, actual_prob_output = sess.run([h, probs])
+      tf.logging.info(np.array_repr(actual_layer_output))
+      tf.logging.info(np.array_repr(actual_prob_output))
+      # pylint: disable=bad-whitespace
+      # pyformat: disable
+      expected_layer_output = [
+          [[-0.2617511,  -0.17463534, -1.1612566,   1.5976431],
+           [ 0.06115358, -1.5903126,   1.1505843,   0.37857458]],
+          [[ 0.821784,    1.0885929,  -1.351966,   -0.5584109],
+           [ 1.1864979,  -1.5562507,  -0.04089222,  0.41064504]],
+          [[ 1.5548539,  -0.6477773,  -1.0664893,   0.15941268],
+           [ 1.1784918,  -1.5536082,   0.43964866, -0.06453241]],
+          [[-0.38961875, -1.4583365,   1.0075824,   0.84037286],
+           [ 1.5903242,  -0.6370207,   0.07592358, -1.0292271]],
+          [[ 0.99643826, -1.232215,   -0.73679215,  0.972569],
+           [-1.1702524,  -0.5360445,   0.18702725,  1.5192697]]]
       expected_prob_output = [
           [[ 0.21795762,  0.,  0.26612395,  0.,  0.31251648, 0.,  0.20340192],
            [ 0.,  0.2677784 ,  0.,  0.32895881,  0., 0.40326279,  0.]],
@@ -772,6 +878,56 @@ class LayersWithAttentionTest(test_utils.TestCase):
       p.has_aux_atten = True
       p.mask_self_atten = True
       p.tr_atten_tpl.num_attention_heads = 2
+      transformer = layers_with_attention.TransformerLayer(p)
+
+      (source_vecs, _, aux_vecs, aux_paddings,
+       _) = self._testTransformerAttentionLayerInputs(depth=depth)
+      source_padding = tf.zeros([5, 2])
+
+      h1, probs1 = transformer.FPropDefaultTheta(
+          source_vecs,
+          source_padding,
+          aux_vecs=aux_vecs,
+          aux_paddings=aux_paddings)
+
+      h2 = []
+      probs2 = []
+      cached_source_vecs = tf.zeros([0, 2, 4])
+      cached_source_contexts = tf.zeros([0, 2, 4])
+      prefix_states = py_utils.NestedMap(
+          key=cached_source_vecs, value=cached_source_contexts)
+      for i in range(5):
+        h, probs, prefix_states = transformer.ExtendStep(
+            transformer.theta, source_vecs[i, :, :], prefix_states, aux_vecs,
+            aux_paddings)
+        h2.append(h)
+        probs2.append(probs)
+
+      h2 = tf.stack(h2)
+      probs2 = tf.concat(probs2, 0)
+
+      tf.global_variables_initializer().run()
+      h1_v, probs1_v, h2_v, probs2_v = sess.run([h1, probs1, h2, probs2])
+      self.assertAllClose(h1_v, h2_v)
+      self.assertAllClose(probs1_v, probs2_v)
+
+  def testTransformerLayerWithNgramMaskExtendStep(self):
+    with self.session(use_gpu=True) as sess:
+      np.random.seed(6348575)
+      depth = 4
+      p = layers_with_attention.TransformerLayer.Params()
+      p.name = 'transformer'
+      p.source_dim = depth
+      p.has_aux_atten = True
+      p.mask_self_atten = True
+      p.tr_atten_tpl.num_attention_heads = 2
+      # Turn on N-gram masking in the TransformerLayer.
+      # Before doing so though copy the self-attention params to avoid
+      # the auxilliary attention being masked as well.
+      p.tr_aux_atten_tpl = p.tr_atten_tpl.Copy()
+      p.tr_atten_tpl.is_masked = True
+      p.tr_atten_tpl.mask_ngram_order = 3
+      p.tr_atten_tpl.mask_type = 'ngram'
       transformer = layers_with_attention.TransformerLayer(p)
 
       (source_vecs, _, aux_vecs, aux_paddings,

@@ -20,7 +20,13 @@ from __future__ import print_function
 
 from lingvo.core import cluster
 
-Cluster = cluster._Cluster
+Cluster = cluster._Cluster  # pylint: disable=protected-access
+
+
+def SetCluster(cls):
+  """Sets Cluster implementation."""
+  global Cluster  # pylint: disable=invalid-name
+  Cluster = cls
 
 
 def Current():
@@ -45,7 +51,8 @@ def ForTestingWorker(mode=None,
                      split_size=None,
                      tpus=None,
                      add_summary=None,
-                     cpus=None):
+                     cpus=None,
+                     do_eval=None):
   """Returns a Cluster for unittesting with a worker."""
   p = Cluster.Params()
   if mode is not None:
@@ -63,4 +70,29 @@ def ForTestingWorker(mode=None,
     p.worker.devices_per_split = split_size
   if add_summary is not None:
     p.add_summary = add_summary
+  if do_eval is not None:
+    p.do_eval = do_eval
   return p.Instantiate()
+
+
+def SetEval(mode):
+  """Returns a cluster with do_eval option turned on/off.
+
+  E.g.::
+
+    def FProp(...):
+      with SetEval(mode=True):
+        # Turns off dropout, noise, etc.
+        y = self.foo.FProp(..., x)
+        z = self.bar.FProp(..., y)
+      # Returns to previous state (e.g., training).
+      y = self.foo.FProp(..., x)
+      z = self.foo.FProp(..., y)
+
+  Args:
+    mode: True, False or None.
+
+  Returns:
+    A new Cluster instance.
+  """
+  return Current().params.Copy().Set(do_eval=mode).Instantiate()

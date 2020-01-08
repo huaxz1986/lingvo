@@ -109,10 +109,14 @@ class BaseProgram(object):
 
   def _InfeedLoop(self, sess):
     tf.logging.info('_InfeedLoop start')
-    for i in range(self._steps_per_loop):
-      tf.logging.vlog(1, '_InfeedLoop %d', i)
-      sess.run(self._model.GetTask().input_generator.tpu_infeed_op)
-    tf.logging.info('_InfeedLoop done')
+    try:
+      for i in range(self._steps_per_loop):
+        tf.logging.vlog(1, '_InfeedLoop %d', i)
+        sess.run(self._model.GetTask().input_generator.tpu_infeed_op)
+      tf.logging.info('_InfeedLoop done')
+    except Exception as e:
+      tf.logging.info('_InfeedLoop exception %r %s', e, e)
+      raise
 
   def BuildTpuSubgraph(self):
     """Sub classes should construct a model/graph to be executed by Run.
@@ -293,11 +297,12 @@ class TrainProgram(BaseProgram):
     eval_metrics = self._eval_metrics.PackMetricsValues(values)
 
     global_step = sess.run(gsteps)
-    step_rate, example_rate = self._step_rate_tracker.ComputeStepRate(
+    step_rate, example_rate, total_examples = self._step_rate_tracker.ComputeStepRate(
         global_step,
         eval_metrics['num_samples_in_batch'][0] * self._steps_per_loop)
     self._SummarizeValue(global_step, 'global_step/sec', step_rate)
     self._SummarizeValue(global_step, 'examples/sec', example_rate)
+    self._SummarizeValue(global_step, 'total_samples', total_examples)
 
     for key, (val, _) in sorted(six.iteritems(eval_metrics)):
       self._SummarizeValue(global_step, key, val)

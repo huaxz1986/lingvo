@@ -1892,9 +1892,9 @@ def _ComputeGradientsTpuNas(loss, all_vars, grad_aggregation_method,
         # Note(yonghui): gradient of a weight param can be all zero if that
         # weight param is not used in the forward computation, e.g. as in
         # switchable layers in neural architecture search.
-        zero_threashold = 1e-8
+        zero_threshold = 1e-8
         g_is_non_zero = tf.cast(
-            tf.reduce_sum(tf.math.abs(g)) > zero_threashold, g.dtype)
+            tf.reduce_sum(tf.math.abs(g)) > zero_threshold, g.dtype)
         num_updates = tf.maximum(tf.tpu.cross_replica_sum(g_is_non_zero), 1.0)
         normalized_g = tf.tpu.cross_replica_sum(g) / num_updates
         aggregated_grads.append(normalized_g)
@@ -2839,6 +2839,32 @@ def PadSequenceDimension(x, length, pad_val, shape=None):
     x = HasRank(x, len(shape))
     x = tf.ensure_shape(x, shape)
   return x
+
+
+def PadSequenceTo(x, padding, length, pad_val):
+  """Pads `x` and `padding` to `length` using `pad_val` along the 2nd dim.
+
+  Pads `x` to `length` using `pad_val`, and `padding` using 1.
+  Raise error if `x.shape[:2]` and `padding.shape` are not the same.
+
+  Args:
+    x: A Tensor of shape [batch, seqlen] or [batch, seqlen, ...].
+    padding: A 0/1 Tensor of shape [batch, seqlen]. 1 is for padded locations.
+    length: A Python int, the length to pad to.
+    pad_val: A Python numeric, used for padding x.
+
+  Returns:
+    A tuple of padded x and padding.
+  """
+
+  batch, slen = GetShape(x, 2)
+
+  padding = HasRank(padding, 2)
+  padding = HasShape(padding, [batch, slen])
+
+  x = PadSequenceDimension(x, length, pad_val)
+  padding = PadSequenceDimension(padding, length, tf.cast(1, padding.dtype))
+  return x, padding
 
 
 def ApplyPadding(padding, x, padded=None, broadcast=True, use_select=True):

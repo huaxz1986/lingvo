@@ -1551,6 +1551,9 @@ class AnchorAssignment(Preprocessor):
       residuals. The model is expected to regress against these residuals as
       targets. The residuals can be converted back into bboxes using
       detection_3d_lib.Utils3D.ResidualsToBBoxes.
+    assigned_gt_idx: base_shape - The corresponding index of the ground
+      truth bounding box for each anchor box in anchor_bboxes, anchors not
+      assigned will have idx be set to -1.
     assigned_gt_bbox: base_shape + [7] - The corresponding ground
       truth bounding box for each anchor box in anchor_bboxes.
     assigned_gt_labels: base_shape - The assigned groundtruth label
@@ -1595,6 +1598,8 @@ class AnchorAssignment(Preprocessor):
         background_assignment_threshold=p.background_assignment_threshold)
 
     # Add new features.
+    features.assigned_gt_idx = tf.reshape(assigned_anchors.assigned_gt_idx,
+                                          base_shape)
     features.assigned_gt_bbox = tf.reshape(assigned_anchors.assigned_gt_bbox,
                                            base_shape + [7])
     features.assigned_gt_labels = tf.reshape(
@@ -1617,6 +1622,7 @@ class AnchorAssignment(Preprocessor):
     box_shape = base_shape.concatenate([7])
 
     shapes.anchor_localization_residuals = box_shape
+    shapes.assigned_gt_idx = base_shape
     shapes.assigned_gt_bbox = box_shape
     shapes.assigned_gt_labels = base_shape
     shapes.assigned_gt_similarity_score = base_shape
@@ -1626,6 +1632,7 @@ class AnchorAssignment(Preprocessor):
 
   def TransformDTypes(self, dtypes):
     dtypes.anchor_localization_residuals = tf.float32
+    dtypes.assigned_gt_idx = tf.int32
     dtypes.assigned_gt_bbox = tf.float32
     dtypes.assigned_gt_labels = tf.int32
     dtypes.assigned_gt_similarity_score = tf.float32
@@ -1798,6 +1805,12 @@ class RandomWorldRotationAboutZAxis(Preprocessor):
         'max_rotation', None,
         'The rotation amount will be randomly picked from '
         '[-max_rotation, max_rotation).')
+    p.Define(
+        'include_world_rot_z', True,
+        'Whether to include the applied rotation as an additional tensor. '
+        'It can be helpful to disable this when using the preprocessor in a '
+        'way that expects the structure of the features to be the same '
+        '(e.g., as a branch in tf.cond).')
     return p
 
   @base_layer.initializer
@@ -1833,15 +1846,18 @@ class RandomWorldRotationAboutZAxis(Preprocessor):
 
     features.labels.bboxes_3d = tf.concat([bboxes_xyz, bboxes_dims, bboxes_rot],
                                           axis=-1)
-    features.world_rot_z = rot
+    if p.include_world_rot_z:
+      features.world_rot_z = rot
     return features
 
   def TransformShapes(self, shapes):
-    shapes.world_rot_z = tf.TensorShape([])
+    if self.params.include_world_rot_z:
+      shapes.world_rot_z = tf.TensorShape([])
     return shapes
 
   def TransformDTypes(self, dtypes):
-    dtypes.world_rot_z = tf.float32
+    if self.params.include_world_rot_z:
+      dtypes.world_rot_z = tf.float32
     return dtypes
 
 
@@ -2654,11 +2670,7 @@ class GroundTruthAugmentor(Preprocessor):
     labels.labels of shape [L]
 
   Modifies the above features so that additional objects from
-  a groundtruth database are added. Also adds:
-
-    labels.bboxes_3d_real_object_mask of shape [L]
-    indcating which labels come from the current scene, rather
-    than those that are augmented from other scenes.
+  a groundtruth database are added.
   """
 
   @classmethod
@@ -2980,10 +2992,6 @@ class GroundTruthAugmentor(Preprocessor):
         num_bboxes_in_scene + num_augmented_bboxes, dtype=tf.float32)
     features.labels.bboxes_3d_mask = py_utils.PadOrTrimTo(
         bboxes_3d_mask, [max_bboxes])
-    # Keep track of which boxes were original.
-    bboxes_3d_real_object_mask = tf.ones(num_bboxes_in_scene, dtype=tf.float32)
-    features.labels.bboxes_3d_real_object_mask = py_utils.PadOrTrimTo(
-        bboxes_3d_real_object_mask, [max_bboxes])
 
     gt_labels = tf.boolean_mask(features.labels.labels, gt_bboxes_3d_mask)
     gt_labels = py_utils.HasShape(gt_labels, [num_bboxes_in_scene])
@@ -2994,11 +3002,9 @@ class GroundTruthAugmentor(Preprocessor):
     return features
 
   def TransformShapes(self, shapes):
-    shapes.labels.bboxes_3d_real_object_mask = shapes.labels.bboxes_3d_mask
     return shapes
 
   def TransformDTypes(self, dtypes):
-    dtypes.labels.bboxes_3d_real_object_mask = tf.float32
     return dtypes
 
 
@@ -3370,12 +3376,20 @@ class SparseSampler(Preprocessor):
     points = tf.concat([points, zeros], axis=0)
 
     num_seeded_points = points_data.get('num_seeded_points', 0)
+
+    neighbor_algorithm = 'auto'
+    # Based on benchmarks, the hash solution works better when the number of
+    # centers is >= 16 and there are at least 10k points per point cloud.
+    if p.num_centers >= 16:
+      neighbor_algorithm = 'hash'
+
     centers, center_paddings, indices, indices_paddings = ops.sample_points(
         points=tf.expand_dims(points, 0),
         points_padding=tf.zeros([1, required_num_points], tf.float32),
         num_seeded_points=num_seeded_points,
         center_selector=p.center_selector,
         neighbor_sampler=p.neighbor_sampler,
+        neighbor_algorithm=neighbor_algorithm,
         num_centers=p.num_centers,
         center_z_min=p.keep_z_range[0],
         center_z_max=p.keep_z_range[1],

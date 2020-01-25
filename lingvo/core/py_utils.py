@@ -63,8 +63,6 @@ tf.flags.DEFINE_bool('print_debug_tensors', False,
 tf.flags.DEFINE_string(
     'xla_device', '', 'If non-empty, can be cpu, gpu, or tpu (case sensitive)')
 
-tf.flags.DEFINE_bool('nas_run', False, 'If True, this is a NAS training run.')
-
 tf.flags.DEFINE_bool(
     'use_resource_var', False,
     'Use ResourceVariable instead of Variable; this option is '
@@ -439,10 +437,6 @@ def use_tpu():  # pylint: disable=invalid-name
   return res
 
 
-def nas_run():  # pylint: disable=invalid-name
-  return _FromGlobal('nas_run')
-
-
 def tpu_compat():  # pylint: disable=invalid-name
   return use_tpu() or _FromGlobal('tpu_compatible')
 
@@ -575,7 +569,7 @@ def Pack(tmpl, values):
   """Packs 'values' according to 'tmpl'."""
   values = list(values)
   flat_tmpl = Flatten(tmpl)
-  assert len(flat_tmpl) == len(values)
+  assert len(flat_tmpl) == len(values), (len(flat_tmpl), len(values))
   v_iter = iter(values)
   # Replace tensors in 'tmpl' with 'values'.
   return Transform(tmpl, lambda _: next(v_iter))
@@ -1360,7 +1354,6 @@ _ALL_VARS_KEY = ('__lingvo_all_vars',)
 
 _get_all_vars = _CollectionGetter(_ALL_VARS_KEY, lambda: {})
 
-
 _VARIABLE_SHAPE_PREFIXES = _ThreadLocalStack().stack
 
 
@@ -1410,7 +1403,9 @@ def CreateVariable(name,
                    trainable=True,
                    init_wrapper=None,
                    collections=None,
-                   default_seed=None):
+                   default_seed=None,
+                   synchronization=tf.VariableSynchronization.AUTO,
+                   aggregation=tf.VariableAggregation.NONE):
   """Creates tf.Variable according to param_config.
 
   Args:
@@ -1427,6 +1422,12 @@ def CreateVariable(name,
       tf.GraphKeys.GLOBAL_VARIABLES).
     default_seed: Seed to use for initialization if not specified in params.
       Used for deterministic initialization in tests.
+    synchronization: Indicates when a distributed a variable will be aggregated.
+      Accepted values are constants defined in the class
+      tf.VariableSynchronization. By default the synchronization is set to AUTO
+      and the current DistributionStrategy chooses when to synchronize.
+    aggregation: Indicates how a distributed variable will be aggregated.
+      Accepted values are constants defined in the class tf.VariableAggregation.
 
   Returns:
     tf.identity(var), var pair. The tf.identity() node is colocated
@@ -1586,7 +1587,9 @@ def CreateVariable(name,
               v_init,
               collections=collections,
               trainable=trainable,
-              validate_shape=True if var_shape is not None else False)
+              validate_shape=True if var_shape is not None else False,
+              synchronization=synchronization,
+              aggregation=aggregation)
       else:
         return tf.get_variable(
             'var',
@@ -1595,7 +1598,9 @@ def CreateVariable(name,
             v_init,
             collections=collections,
             trainable=trainable,
-            validate_shape=True if var_shape is not None else False)
+            validate_shape=True if var_shape is not None else False,
+            synchronization=synchronization,
+            aggregation=aggregation)
 
   if _get_opportunistic_variable_reuse()[0]:
     try:
@@ -1969,7 +1974,8 @@ def ComputeGradients(
     grad_aggregation_method=tf.AggregationMethod.EXPERIMENTAL_TREE,
     colocate_gradients_with_ops=True,
     gate_gradients=False,
-    compute_gradients_fn=None):
+    compute_gradients_fn=None,
+    skip_zero_gradients=False):
   """Computes gradients of variables in vmap w.r.t loss.
 
   Args:
@@ -1985,6 +1991,10 @@ def ComputeGradients(
     compute_gradients_fn: Function to use to compute gradients. If None, use
       default. compute_gradients_fn should have the same signature as this
       function, but without the last argument.
+    skip_zero_gradients: Whether to skip aggregating zero gradients. This helps
+      in case where some weights may not be used in forward computation, e.g.,
+      sparsely activated networks or switchable layers in neural architectural
+      search.
 
   Returns:
     var_grad - a `.NestedMap` of (variable, gradient). You can view
@@ -2025,7 +2035,7 @@ def ComputeGradients(
   else:
     # tpu vs non-tpu is slightly different.
     if use_tpu():
-      if nas_run():
+      if skip_zero_gradients:
         take_grad = _ComputeGradientsTpuNas
       else:
         take_grad = _ComputeGradientsTpu
@@ -3292,18 +3302,36 @@ def FPropDtype(params):
 
 def UpdateFpropDtype(params, fprop_dtype):
   """Recursively update the fprop_dtype of the Params."""
+  # Handle the case when the input "params" is not an instance of hyperparams
+  # For example, when UpdateDtype is called recursively for all the items in
+  # the "sub" list of SequentialLayer (see 1st elif below)
+  if not isinstance(params, hyperparams.Params):
+    return
+
   for key, val in params.IterParams():
     if isinstance(val, hyperparams.Params):
       UpdateFpropDtype(val, fprop_dtype)
+    elif isinstance(val, (list, tuple)):
+      for item in val:
+        UpdateFpropDtype(item, fprop_dtype)
     elif key == 'fprop_dtype':
       params.fprop_dtype = fprop_dtype
 
 
 def UpdateDtype(params, dtype):
   """Recursively update the dtype of the Params."""
+  # Handle the case when the input "params" is not an instance of hyperparams
+  # For example, when UpdateDtype is called recursively for all the items in
+  # the "sub" list of SequentialLayer (see 1st elif below)
+  if not isinstance(params, hyperparams.Params):
+    return
+
   for key, val in params.IterParams():
     if isinstance(val, hyperparams.Params):
       UpdateDtype(val, dtype)
+    elif isinstance(val, (list, tuple)):
+      for item in val:
+        UpdateDtype(item, dtype)
     elif key == 'dtype':
       params.dtype = dtype
 
@@ -3779,36 +3807,42 @@ def _DefineDefun(fwd, bak, args):
   """Wraps fwd in a defun with custom gradient bak.
 
   Args:
-    fwd: A callable xs: NestedMap -> ys: NestedMap.
-    bak: A callable xs, ys, dys: NestedMap -> dxs: NestedMap. The custom
-      backprop function for fwd.
-    args: A NestedMap of tf.Tensor.
+    fwd: A callable xs: Nested Structure -> ys: Nested Structure.
+    bak: A callable xs, ys, dys: Nested Structure -> dxs: Nested Structure. The
+      custom backprop function for fwd.
+    args: A Nested Structure of tf.Tensor.
 
   Returns:
     A NestedMap w/ fields:
       defun: A tf.Defun wraps fwd
-      args:  A NestedMap of tf.DType
-      rets:  A NestedMap of tf.DType
+      args:  A Nested Structure of tf.DType
+      rets:  A Nested Structure of tf.DType
   """
   assert fwd is not None
 
   # fwd signature (tf.Tensor dtypes).
-  rets = fwd(args)
   get_dtype = lambda x: x.dtype
-  sigs = NestedMap(
-      args=args.Transform(get_dtype), rets=rets.Transform(get_dtype))
+  sigs = NestedMap(args=tf.nest.map_structure(get_dtype, args))
+
+  get_shape = lambda x: x.shape
+  arg_shapes = tf.nest.map_structure(get_shape, args)
 
   def Backward(op, *args):
     assert bak is not None
-    xs = sigs.args.Pack(op.inputs)
-    ys = sigs.rets.Pack(op.outputs)
-    dys = sigs.rets.Pack(args)
+    xs = tf.nest.pack_sequence_as(sigs.args, op.inputs)
+    # Note: sigs.rets will be set during the Forward call.
+    ys = tf.nest.pack_sequence_as(sigs.rets, op.outputs)
+    dys = tf.nest.pack_sequence_as(sigs.rets, args)
     dxs = bak(xs, ys, dys)
-    return dxs.Flatten()
+    return tf.nest.flatten(dxs)
 
-  @tf.Defun(*sigs.args.Flatten(), python_grad_func=Backward)
+  @tf.Defun(*tf.nest.flatten(sigs.args), python_grad_func=Backward)
   def Forward(*args):
-    return fwd(sigs.args.Pack(args)).Flatten()
+    for arg, shape in zip(args, tf.nest.flatten(arg_shapes)):
+      arg.set_shape(shape)
+    rets = fwd(tf.nest.pack_sequence_as(sigs.args, args))
+    sigs.rets = tf.nest.map_structure(get_dtype, rets)
+    return tf.nest.flatten(rets)
 
   sigs.defun = Forward
   return sigs
@@ -3818,16 +3852,82 @@ def CallDefun(fwd, bak, args):
   """Wraps fwd in a defun with custom gradient bak and calls it with args.
 
   Args:
-    fwd: A callable xs: NestedMap -> ys: NestedMap.
-    bak: A callable xs, ys, dys: NestedMap -> dxs: NestedMap. The custom
-      backprop function for fwd.
-    args: A NestedMap of tf.Tensor.
+    fwd: A callable xs: Nested Structure -> ys: Nested Structure.
+    bak: A callable xs, ys, dys: Nested Structure -> dxs: Nested Structure. The
+      custom backprop function for fwd.
+    args: A Nested Structure of tf.Tensor.
 
   Returns:
-    A NestedMap equivalent to what fwd(args) computes.
+    A Nested Structure equivalent to what fwd(args) computes.
   """
   sigs = _DefineDefun(fwd, bak, args)
-  rets = sigs.defun(*args.Flatten())
-  if not isinstance(rets, (tuple, list)):
-    rets = [rets]
-  return sigs.rets.Pack(rets)
+  flat_rets = sigs.defun(*tf.nest.flatten(args))
+  if not isinstance(flat_rets, (tuple, list)):
+    flat_rets = [flat_rets]
+  return tf.nest.pack_sequence_as(sigs.rets, flat_rets)
+
+
+def _Itype():
+  """Loop iterator data type."""
+  return tf.int32 if use_xla() else tf.int64
+
+
+def WhileLoop(cond, body, loop_state):
+  """Helper to construct a while loop.
+
+  Args:
+    cond: A callable NestedMap -> tf.bool.
+    body: A callable NestedMap -> NestedMap.
+    loop_state: A flattenable (NestedMap, list, tuple, etc.) representing the
+      loop state.
+
+  Returns:
+    The final loop state in the same structure as loop_state.
+  """
+  state = NestedMap(loop_state=loop_state)
+  dtypes = state.Transform(lambda x: x.dtype).Flatten()
+
+  @tf.Defun(*dtypes)
+  def LoopCond(*args):
+    s = state.Pack(args)
+    return cond(s.loop_state)
+
+  @tf.Defun(*dtypes)
+  def LoopBody(*args):
+    s = state.Pack(args)
+    s.loop_state = body(s.loop_state)
+    return s.Flatten()
+
+  return state.Pack(
+      tf.While(input_=state.Flatten(), cond=LoopCond, body=LoopBody)).loop_state
+
+
+def ForLoop(body, start, limit, delta, loop_state):
+  """Helper to construct a for loop.
+
+  Args:
+    body: A callable (tf.int, NestedMap) -> NestedMap.
+    start: Loop variable's initial value.
+    limit: Loop variable's limit value.
+    delta: Loop variable's change per iteration.
+    loop_state: A flattenable (NestedMap, list, tuple, etc.) representing the
+      loop state.
+
+  Returns:
+    The final loop state in the same structure as loop_state.
+  """
+  state = NestedMap(
+      iter=tf.cast(start, _Itype()),
+      limit=tf.cast(limit, _Itype()),
+      delta=tf.cast(delta, _Itype()),
+      loop_state=loop_state)
+
+  def LoopCond(state):
+    return tf.less(state.iter, state.limit)
+
+  def LoopBody(state):
+    state.loop_state = body(state.iter, state.loop_state)
+    state.iter = tf.add(state.iter, state.delta)
+    return state
+
+  return WhileLoop(LoopCond, LoopBody, state).loop_state

@@ -18,6 +18,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import importlib
+
 import tensorflow.compat.v1 as tf1
 from tensorflow.compat.v2 import *  # pylint:disable=wildcard-import, g-bad-import-order
 
@@ -28,24 +30,17 @@ from absl import flags
 from absl import logging
 # pylint: disable=g-direct-tensorflow-import
 from tensorflow.python import tf2
-from tensorflow.python.compat import v2_compat
 
 from tensorflow.python.framework import function as _function_lib
 from tensorflow.python.ops import functional_ops
 from tensorflow.python.ops import inplace_ops
 from tensorflow.python.platform import app
-
-# The following imports are needed to expose private _Send/_Recv ops
-# on TensorFlow 1.X. The could be removed once support for 1.X is dropped.
-from google.protobuf import text_format as _text_format
-from tensorflow.core.framework import op_def_pb2 as _op_def_pb2
-from tensorflow.python.framework import op_def_library as _op_def_library
-from tensorflow.python.framework import op_def_registry as _op_def_registry
 # pylint: enable=g-direct-tensorflow-import
+# pylint: enable=unused-import, g-bad-import-order, g-import-not-at-top
 
 _force_disable_v2 = True
 if _force_disable_v2:
-  v2_compat.disable_v2_behavior()
+  tf1.disable_v2_behavior()
 elif tf2.enabled():
   logging.warning("Lingvo does not support all TF2 behaviors yet. "
                   "Please disable V2 behavior with tf.disable_v2_behavior(), "
@@ -64,6 +59,24 @@ GetExtraArgs = _function_lib.get_extra_args
 # Move this V2 symbol here to avoid being overwritten by its following V1
 # version.
 where_v2 = where  # pylint: disable=undefined-variable, used-before-assignment
+
+# Import the local V2 module to maker sure the following V1 overwritting never
+# applies to the global module and symbol.
+data = importlib.import_module("tensorflow.compat.v2.data")
+graph_util = importlib.import_module("tensorflow.compat.v2.graph_util")
+image = importlib.import_module("tensorflow.compat.v2.image")
+initializers = importlib.import_module(
+    "tensorflow.compat.v2.keras.initializers")
+io = importlib.import_module("tensorflow.compat.v2.io")
+losses = importlib.import_module("tensorflow.compat.v2.keras.losses")
+metrics = importlib.import_module("tensorflow.compat.v2.keras.metrics")
+nn = importlib.import_module("tensorflow.compat.v2.nn")
+random = importlib.import_module("tensorflow.compat.v2.random")
+saved_model = importlib.import_module("tensorflow.compat.v2.saved_model")
+strings = importlib.import_module("tensorflow.compat.v2.strings")
+summary = importlib.import_module("tensorflow.summary")
+test = importlib.import_module("tensorflow.compat.v2.test")
+train = importlib.import_module("tensorflow.compat.v2.train")
 
 # V1 symbols used in the codebase, and can be migrated to the v2 version later.
 # pylint: disable=undefined-variable
@@ -113,6 +126,7 @@ gradients = tf1.gradients
 graph_util.convert_variables_to_constants = (
     tf1.graph_util.convert_variables_to_constants)
 graph_util.extract_sub_graph = tf1.graph_util.extract_sub_graph
+GraphDef = tf1.GraphDef
 GraphKeys = tf1.GraphKeys
 GraphOptions = tf1.GraphOptions
 image.resize_bilinear = tf1.image.resize_bilinear
@@ -189,6 +203,7 @@ saved_model.build_signature_def = tf1.saved_model.build_signature_def
 saved_model.load = tf1.saved_model.load
 saved_model.loader = tf1.saved_model.loader
 saved_model.signature_constants = tf1.saved_model.signature_constants
+saved_model.simple_save = tf1.saved_model.simple_save
 saved_model.tag_constants = tf1.saved_model.tag_constants
 saved_model.utils = tf1.saved_model.utils
 Session = tf1.Session
@@ -205,6 +220,7 @@ if tf1.summary is not None:
   # to prohibit the direct use of it.
   # It is safe to skip copying tf.summary members in such cases.
   summary.FileWriter = tf1.summary.FileWriter
+  summary.histogram = tf1.summary.histogram
   summary.image = tf1.summary.image
   summary.merge = tf1.summary.merge
   summary.merge_all = tf1.summary.merge_all
@@ -307,131 +323,3 @@ unsorted_segment_min = math.unsorted_segment_min
 unsorted_segment_sum = math.unsorted_segment_sum
 VarLenFeature = io.VarLenFeature
 # pylint: enable=undefined-variable
-
-
-# TODO(slebedev): Remove after there is no need to support 1.X.
-def _InitOpDefLibrary():
-  op_list = _op_def_pb2.OpList()
-  _text_format.Merge(_InitOpDefLibrary.op_list_ascii, op_list)
-  _op_def_registry.register_op_list(op_list)
-  op_def_lib = _op_def_library.OpDefLibrary()
-  op_def_lib.add_op_list(op_list)
-  return op_def_lib
-
-
-_InitOpDefLibrary.op_list_ascii = """\
-op {
-  name: "_Recv"
-  output_arg {
-    name: "tensor"
-    type_attr: "tensor_type"
-  }
-  attr {
-    name: "tensor_type"
-    type: "type"
-  }
-  attr {
-    name: "tensor_name"
-    type: "string"
-  }
-  attr {
-    name: "send_device"
-    type: "string"
-  }
-  attr {
-    name: "send_device_incarnation"
-    type: "int"
-  }
-  attr {
-    name: "recv_device"
-    type: "string"
-  }
-  attr {
-    name: "client_terminated"
-    type: "bool"
-    default_value {
-      b: false
-    }
-  }
-  is_stateful: true
-}
-op {
-  name: "_Send"
-  input_arg {
-    name: "tensor"
-    type_attr: "T"
-  }
-  attr {
-    name: "T"
-    type: "type"
-  }
-  attr {
-    name: "tensor_name"
-    type: "string"
-  }
-  attr {
-    name: "send_device"
-    type: "string"
-  }
-  attr {
-    name: "send_device_incarnation"
-    type: "int"
-  }
-  attr {
-    name: "recv_device"
-    type: "string"
-  }
-  attr {
-    name: "client_terminated"
-    type: "bool"
-    default_value {
-      b: false
-    }
-  }
-  is_stateful: true
-}
-"""
-
-
-def _Recv(tensor_type,
-          tensor_name,
-          send_device,
-          send_device_incarnation,
-          recv_device,
-          name=None):
-  return _op_def_lib.apply_op(
-      "_Recv",
-      tensor_type=tensor_type,
-      tensor_name=tensor_name,
-      send_device=send_device,
-      send_device_incarnation=send_device_incarnation,
-      recv_device=recv_device,
-      client_terminated=False,
-      name=name if name else "Recv")
-
-
-def _Send(tensor,
-          tensor_name,
-          send_device,
-          send_device_incarnation,
-          recv_device,
-          name=None):
-  return _op_def_lib.apply_op(
-      "_Send",
-      tensor=tensor,
-      tensor_name=tensor_name,
-      send_device=send_device,
-      send_device_incarnation=send_device_incarnation,
-      recv_device=recv_device,
-      client_terminated=False,
-      name=name if name else "Send")
-
-
-# pylint: disable=undefined-variable
-if not hasattr(raw_ops, "Send") and not hasattr(raw_ops, "Recv"):
-  _op_def_lib = _InitOpDefLibrary()
-  raw_ops.Send = _Send
-  raw_ops.Recv = _Recv
-# pylint: enable=undefined-variable
-
-del _Send, _Recv, _InitOpDefLibrary

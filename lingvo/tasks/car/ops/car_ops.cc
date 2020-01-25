@@ -154,6 +154,7 @@ REGISTER_OP("AveragePrecision3D")
     .Input("prediction_score: float")
     .Output("average_precision: float")
     .Output("precision_recall: float")
+    .Output("score_and_hit: float")
     .Attr("num_recall_points: int >= 1 = 1")
     .Attr("algorithm: string = \"KITTI\"")
     .Doc(R"doc(
@@ -172,10 +173,10 @@ prediction_imageid: [M]. M image ids for the predicted bounding boxes.
 prediction_score: [M]. M scores for each predicted bounding box.
 prediction_ignore: [N]. The ignore types for predictions. Currently only used by
   the KITTI AP. Valid values are 0 - Don't ignore; 1 - Ignore the first match.
-average_precision:
-  A scalar. The AP metric.
-precision_recall:
-  [num_recall_points, 2]. List of PR points.
+average_precision: A scalar. The AP metric.
+precision_recall: [num_recall_points, 2]. List of PR points.
+score_and_hit: [M, 2] Prediction score and corresponding binary indication
+  whether a prediction detected a ground truth item.
 algorithm: string. One of ["KITTI", "VOC"]. See this paper "Supervised
   learning and evaluation of KITTI's cars detector with DPM", Section III.A for
   the differences between KITTI AP and VOC AP.
@@ -192,6 +193,7 @@ REGISTER_OP("SamplePoints")
     .Output("indices_padding: float")
     .Attr("center_selector: string")
     .Attr("neighbor_sampler: string")
+    .Attr("neighbor_algorithm: string = \"auto\"")
     .Attr("num_centers: int")
     .Attr("center_z_min: float")
     .Attr("center_z_max: float")
@@ -237,6 +239,7 @@ indices_padding:
   [B, M, P]. 0/1 padding of indices.
 center_selector: Valid options - 'farthest', 'uniform'.
 neighbor_sampler: Valid options - 'uniform', 'closest'.
+neighbor_algorithm: Valid options - 'auto', 'hash'.
 num_centers: The number of centers to sample for each batch example (M).
 center_z_min: Points with z less than center_z_min are not considered for
  center selection.

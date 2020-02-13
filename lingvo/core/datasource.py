@@ -104,6 +104,7 @@ class SimpleDataSource(DataSource):
 
     ret = py_utils.NestedMap()
     ret.data = data_source_from_file_pattern_fn(file_pattern)
+    ret.bprop_variable_filters = ['']
     return ret
 
 
@@ -155,7 +156,7 @@ class ChainingDataSource(DataSource):
 
 
 class WithinBatchMixingDataSource(DataSource):
-  """A data source that reads each file_pattern in sequence."""
+  """Mixes records from different sources into the same batch."""
 
   @classmethod
   def Params(cls):
@@ -214,7 +215,7 @@ class WithinBatchMixingDataSource(DataSource):
 
 
 class CrossBatchMixingDataSource(DataSource):
-  """A data source that reads each file_pattern in sequence."""
+  """Mixes batches from different sources, each batch from only one source."""
 
   @classmethod
   def Params(cls):
@@ -369,8 +370,10 @@ class CurriculumDataSource(DataSource):
     def GetDatasourceFn(idx):
 
       def DatasourceFn():
-        return datasources[idx].BuildDataSource(
+        datasource = datasources[idx].BuildDataSource(
             data_source_from_file_pattern_fn)
+        datasource.pop('bprop_variable_filters', None)
+        return datasource
 
       return DatasourceFn
 

@@ -8,6 +8,7 @@
 @string{iclr = {Proc. International Conference on Learning Representations ({ICLR})}}
 @string{icml = {Proc. International Conference on Machine Learning ({ICML})}}
 @string{interspeech = {Proc. Interspeech}}
+@string{naacl = {Proc. Conference of the North American Chapter of the Association for Computational Linguistics ({NAACL})}}
 @string{nips = {Advances in Neural Information Processing Systems}}
 @string{slt = {Proc. {IEEE} Spoken Language Technology Workshop ({SLT})}}
 
@@ -91,7 +92,7 @@
 @article{kuczmarski2018gender,
   annote = nmt,
   title={Gender-Aware Natural Language Translation},
-  author={Kuczmarski, James and Johnson, Melvin},
+  author={J. Kuczmarski and M. Johnson},
   year={2018},
   pdf = {https://www.tdcommons.org/dpubs_series/1577/},
 }
@@ -99,20 +100,61 @@
 @article{aharoni2019massively,
   annote = nmt,
   title={Massively Multilingual Neural Machine Translation},
-  author={Aharoni, Roee and Johnson, Melvin and Firat, Orhan},
-  journal={arXiv preprint arXiv:1903.00089},
+  author={R. Aharoni and M. Johnson and O. Firat},
+  booktitle = naacl,
   year={2019},
   pdf = {https://arxiv.org/pdf/1903.00089.pdf},
 }
 
+@article{luo2019neural,
+  annote = nmt,
+  title={Neural Decipherment via Minimum-Cost Flow: From Ugaritic to Linear B},
+  author={J. Luo and Y. Cao and R. Barzilay},
+  booktitle = acl,
+  year={2019},
+  url = {https://www.aclweb.org/anthology/P19-1303/},
+}
+
+
+@inproceedings{milk,
+    annote = nmt,
+    title={Monotonic Infinite Lookback Attention for Simultaneous Machine Translation},
+    author={Naveen Arivazhagan and Colin Cherry and Wolfgang Macherey and Chung-Cheng Chiu and Semih Yavuz and Ruoming Pang and Wei Li and Colin Raffel},
+    booktitle = acl,
+    year={2019},
+    url = {https://arxiv.org/pdf/1906.05218}
+}
+
 @article{freitag2019text,
   annote = nmt,
-  author = {{Freitag}, Markus and {Caswell}, Isaac and {Roy}, Scott},
-  title = "{Text Repair Model for Neural Machine Translation}",
-  journal = {arXiv e-prints},
+  author = {M. Freitag and I. Caswell and S. Roy},
+  title = {APE at Scale and Its Implications on MT Evaluation Biases},
+  booktitle = {Proceedings of the Fourth Conference on Machine Translation (Volume 1: Research Papers)},
+  publisher = {Association for Computational Linguistics},
+  url = {https://www.aclweb.org/anthology/W19-5204},
   year = {2019},
   pdf = {https://arxiv.org/abs/1904.04790},
 }
+
+@article{arivazhagan2019,
+  annote = nmt,
+  author = {N. Arivazhagan and A. Bapna and O. Firat and D. Lepikhin and M. Johnson and M. Krikun and M. X. Chen and Y. Cao and G. Foster and C. Cherry and W. Macherey and Z. Chen and Y. Wu},
+  title = {Massively Multilingual Neural Machine Translation in the Wild: Findings and Challenges},
+  year      = {2019},
+  url       = {http://arxiv.org/abs/1907.05019},
+  archivePrefix = {arXiv},
+  eprint    = {1907.05019},
+}
+
+@incollection{huang2019gpipe,
+  annote = nmt,
+  author = {Y. Huang and Y. Cheng and A. Bapna and O. Firat and M. X. Chen and D. Chen and H. Lee and J. Ngiam and Q. V. Le and Y. Wu and Z. Chen},
+  title = {GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism},
+  booktitle = nips,
+  year = {2019},
+  url = {https://arxiv.org/abs/1811.06965}
+}
+
 
 %%%%%%%%%%%%%%%%%%%%
 % Speech recognition papers.
@@ -272,7 +314,7 @@
 
 @inproceedings{qin2019imperceptible,
   annote = asr,
-  author = {Y. Qin and N. Carlini and I. Goodfellow and G. Cottrell and C.  Raffel}, 
+  author = {Y. Qin and N. Carlini and I. Goodfellow and G. Cottrell and C.  Raffel},
   title = {Imperceptible, Robust, and Targeted Adversarial Examples for Automatic Speech Recognition},
   booktitle = icml,
   year = {2019},
@@ -361,6 +403,69 @@
 }
 
 
+@inproceedings{TaraRuoming19,
+  annote = asr,
+  title={Two-Pass End-to-End Speech Recognition},
+  author={T. N. Sainath and R. Pang and D. Rybach and Y. He and R. Prabhavalkar and W. Li and M. Visontai and Q. Liang and T. Strohman and Y. Wu and I. McGraw and C.-C. Chiu},
+  booktitle = interspeech,
+  year={2019},
+  pdf = {https://arxiv.org/pdf/1908.10992},
+}
+
+@inproceedings{Chiu19longform,
+  annote = asr,
+  title={A Comparison of End-to-end Models for Long-form Speech Recognition},
+  author={C.-C. Chiu and W. Han and Y. Zhang and R. Pang and S. Kishchenko and P. Nguyen and A. Narayanan and H. Liao and S. Zhang and A. Kannan and R. Prabhavalkar and Z. Chen and T. Sainath and Y. Wu},
+  booktitle = asru,
+  year={2019},
+  pdf = {https://arxiv.org/pdf/1911.02242}
+}
+
+
+@inproceedings{narayanan2019longform,
+  annote = asr,
+  author={A. Narayanan and R. Prabhavalkar and C.C. Chiu and D. Rybach and T.N. Sainath and T. Strohman},
+  title={Recognizing Long-Form Speech Using Streaming End-to-End Models},
+  booktitle = asru,
+  year={2019},
+  pdf = {https://arxiv.org/pdf/1910.11455}
+}
+
+
+@inproceedings{sainath2020,
+  annote = asr,
+  title = {An Attention-Based Joint Acoustic and Text On-Device End-to-End Model},
+  author = {Tara N. Sainath and Ruoming Pang and Ron Weiss and Yanzhang He and Chung-Cheng Chiu and Trevor Strohman},
+  booktitle = icassp,
+  year = {2020},
+}
+
+
+@inproceedings{lu2020,
+  annote = asr,
+  title = {Speech Sentiment Analysis via Pre-Trained Features from End-To-End ASR Models},
+  author = {Zhiyun Lu and Liangliang Cao and Yu Zhang and Chung-Cheng Chiu and James Fan},
+  booktitle = icassp,
+  year = {2020},
+}
+
+
+@inproceedings{park2020,
+  annote = asr,
+  title = {SpecAugment on Large Scale Datas},
+  author = {Daniel Park and Yu Zhang and Chung-Cheng Chiu and Youzheng Chen and Bo Li and William Chan and Quoc Le and Yonghui Wu},
+  booktitle = icassp,
+  year = {2020},
+}
+
+
+@inproceedings{e2e2020,
+  annote = asr,
+  title = {A Streaming On-Device End-to-End Model Surpassing Server-Side Conventional Model Quality and Latency},
+  author = {Tara Sainath and Yanzhang He and Bo Li and Arun Narayanan and Ruoming Pang and Antoine Bruguier and Shuo-yiin Chang and Wei Li and Raziel Alvarez and Zhifeng Chen and Chung-cheng Chiu and David Garcia and Alex Gruenstein and Ke Hu and Minho Jin and Anjuli Kannan and Qiao Liang and Ian McGraw and Cal Peyser and Rohit Prabhavalkar and Golan Pundak and David Rybach and Yuan Shangguan and Yash Sheth and Trevor Strohman and Mirko Visontai and Yonghui Wu and Yu Zhang and Ding Zhao},
+  booktitle = icassp,
+  year = {2020},
+}
 %%%%%%%%%%%%%%%%%%%%
 % Language understanding papers.
 
@@ -389,6 +494,17 @@
   booktitle = slt,
   year = {2018},
   pdf = {https://arxiv.org/abs/1809.09190},
+}
+
+@inproceedings{chen2019smartcompose,
+  annote = nlu,
+  author = {M. X. Chen and B. N. Lee and G. Bansal and Y. Cao and S. Zhang and J. Lu and J. Tsay and Y. Wang and A. M. Dai and Z. Chen and T. Sohn and Y. Wu},
+  title = {Gmail Smart Compose: Real-Time Assisted Writing},
+  booktitle = {Proceedings of the 25th ACM SIGKDD International Conference on Knowledge Discovery & Data Mining},
+  year = {2019},
+  publisher = {Association for Computing Machinery},
+  url = {https://dl.acm.org/doi/10.1145/3292500.3330723},
+  pdf = {https://arxiv.org/abs/1906.00080},
 }
 
 

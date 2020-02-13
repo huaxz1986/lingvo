@@ -126,7 +126,7 @@ J.&nbsp;Kuczmarski and M.&nbsp;Johnson, &ldquo;Gender-aware natural language tra
 </td>
 <td class="bibtexitem">
 R.&nbsp;Aharoni, M.&nbsp;Johnson, and O.&nbsp;Firat, &ldquo;Massively multilingual neural machine
-  translation,&rdquo; <em>arXiv preprint arXiv:1903.00089</em>, 2019.
+  translation,&rdquo; 2019.
 [&nbsp;<a href="https://arxiv.org/pdf/1903.00089.pdf">pdf</a>&nbsp;]
 
 </td>
@@ -135,12 +135,72 @@ R.&nbsp;Aharoni, M.&nbsp;Johnson, and O.&nbsp;Firat, &ldquo;Massively multilingu
 
 <tr valign="top">
 <td align="right" class="bibtexnumber">
-[<a name="freitag2019text">9</a>]
+[<a name="luo2019neural">9</a>]
 </td>
 <td class="bibtexitem">
-M.&nbsp;Freitag, I.&nbsp;Caswell, and S.&nbsp;Roy, &ldquo;Text Repair Model for Neural
-  Machine Translation,&rdquo; <em>arXiv e-prints</em>, 2019.
-[&nbsp;<a href="https://arxiv.org/abs/1904.04790">pdf</a>&nbsp;]
+J.&nbsp;Luo, Y.&nbsp;Cao, and R.&nbsp;Barzilay, &ldquo;Neural decipherment via minimum-cost flow:
+  From ugaritic to linear b,&rdquo; 2019.
+[&nbsp;<a href="https://www.aclweb.org/anthology/P19-1303/">http</a>&nbsp;]
+
+</td>
+</tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="milk">10</a>]
+</td>
+<td class="bibtexitem">
+N.&nbsp;Arivazhagan, C.&nbsp;Cherry, W.&nbsp;Macherey, C.-C. Chiu, S.&nbsp;Yavuz, R.&nbsp;Pang, W.&nbsp;Li,
+  and C.&nbsp;Raffel, &ldquo;Monotonic infinite lookback attention for simultaneous
+  machine translation,&rdquo; in <em>Proc. Annual Meeting of the Association for
+  Computational Linguistics (ACL)</em>, 2019.
+[&nbsp;<a href="https://arxiv.org/pdf/1906.05218">http</a>&nbsp;]
+
+</td>
+</tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="freitag2019text">11</a>]
+</td>
+<td class="bibtexitem">
+M.&nbsp;Freitag, I.&nbsp;Caswell, and S.&nbsp;Roy, &ldquo;Ape at scale and its implications on mt
+  evaluation biases,&rdquo; 2019.
+[&nbsp;<a href="https://arxiv.org/abs/1904.04790">pdf</a>&nbsp;| 
+<a href="https://www.aclweb.org/anthology/W19-5204">http</a>&nbsp;]
+
+</td>
+</tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="arivazhagan2019">12</a>]
+</td>
+<td class="bibtexitem">
+N.&nbsp;Arivazhagan, A.&nbsp;Bapna, O.&nbsp;Firat, D.&nbsp;Lepikhin, M.&nbsp;Johnson, M.&nbsp;Krikun, M.&nbsp;X.
+  Chen, Y.&nbsp;Cao, G.&nbsp;Foster, C.&nbsp;Cherry, W.&nbsp;Macherey, Z.&nbsp;Chen, and Y.&nbsp;Wu,
+  &ldquo;Massively multilingual neural machine translation in the wild: Findings and
+  challenges,&rdquo; 2019.
+[&nbsp;<a href="http://arxiv.org/abs/1907.05019">arXiv</a>&nbsp;| 
+<a href="http://arxiv.org/abs/1907.05019">http</a>&nbsp;]
+
+</td>
+</tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="huang2019gpipe">13</a>]
+</td>
+<td class="bibtexitem">
+Y.&nbsp;Huang, Y.&nbsp;Cheng, A.&nbsp;Bapna, O.&nbsp;Firat, M.&nbsp;X. Chen, D.&nbsp;Chen, H.&nbsp;Lee, J.&nbsp;Ngiam,
+  Q.&nbsp;V. Le, Y.&nbsp;Wu, and Z.&nbsp;Chen, &ldquo;Gpipe: Efficient training of giant neural
+  networks using pipeline parallelism,&rdquo; in <em>Advances in Neural Information
+  Processing Systems</em>, 2019.
+[&nbsp;<a href="https://arxiv.org/abs/1811.06965">http</a>&nbsp;]
 
 </td>
 </tr>
@@ -548,6 +608,107 @@ D.&nbsp;Zhao, T.&nbsp;N. Sainath, D.&nbsp;Rybach, D.&nbsp;Bhatia, B.&nbsp;Li, an
 
 </td>
 </tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="TaraRuoming19">28</a>]
+</td>
+<td class="bibtexitem">
+T.&nbsp;N. Sainath, R.&nbsp;Pang, D.&nbsp;Rybach, Y.&nbsp;He, R.&nbsp;Prabhavalkar, W.&nbsp;Li, M.&nbsp;Visontai,
+  Q.&nbsp;Liang, T.&nbsp;Strohman, Y.&nbsp;Wu, I.&nbsp;McGraw, and C.-C. Chiu, &ldquo;Two-pass
+  end-to-end speech recognition,&rdquo; in <em>Proc. Interspeech</em>, 2019.
+[&nbsp;<a href="https://arxiv.org/pdf/1908.10992">pdf</a>&nbsp;]
+
+</td>
+</tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="Chiu19longform">29</a>]
+</td>
+<td class="bibtexitem">
+C.-C. Chiu, W.&nbsp;Han, Y.&nbsp;Zhang, R.&nbsp;Pang, S.&nbsp;Kishchenko, P.&nbsp;Nguyen, A.&nbsp;Narayanan,
+  H.&nbsp;Liao, S.&nbsp;Zhang, A.&nbsp;Kannan, R.&nbsp;Prabhavalkar, Z.&nbsp;Chen, T.&nbsp;Sainath, and
+  Y.&nbsp;Wu, &ldquo;A comparison of end-to-end models for long-form speech
+  recognition,&rdquo; 2019.
+[&nbsp;<a href="https://arxiv.org/pdf/1911.02242">pdf</a>&nbsp;]
+
+</td>
+</tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="narayanan2019longform">30</a>]
+</td>
+<td class="bibtexitem">
+A.&nbsp;Narayanan, R.&nbsp;Prabhavalkar, C.&nbsp;Chiu, D.&nbsp;Rybach, T.&nbsp;Sainath, and T.&nbsp;Strohman,
+  &ldquo;Recognizing long-form speech using streaming end-to-end models,&rdquo; 2019.
+[&nbsp;<a href="https://arxiv.org/pdf/1910.11455">pdf</a>&nbsp;]
+
+</td>
+</tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="sainath2020">31</a>]
+</td>
+<td class="bibtexitem">
+T.&nbsp;N. Sainath, R.&nbsp;Pang, R.&nbsp;Weiss, Y.&nbsp;He, C.-C. Chiu, and T.&nbsp;Strohman, &ldquo;An
+  attention-based joint acoustic and text on-device end-to-end model,&rdquo; in <em>
+  Proc. IEEE International Conference on Acoustics, Speech, and Signal
+  Processing (ICASSP)</em>, 2020.
+
+</td>
+</tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="lu2020">32</a>]
+</td>
+<td class="bibtexitem">
+Z.&nbsp;Lu, L.&nbsp;Cao, Y.&nbsp;Zhang, C.-C. Chiu, and J.&nbsp;Fan, &ldquo;Speech sentiment analysis
+  via pre-trained features from end-to-end asr models,&rdquo; in <em>Proc. IEEE
+  International Conference on Acoustics, Speech, and Signal Processing
+  (ICASSP)</em>, 2020.
+
+</td>
+</tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="park2020">33</a>]
+</td>
+<td class="bibtexitem">
+D.&nbsp;Park, Y.&nbsp;Zhang, C.-C. Chiu, Y.&nbsp;Chen, B.&nbsp;Li, W.&nbsp;Chan, Q.&nbsp;Le, and Y.&nbsp;Wu,
+  &ldquo;Specaugment on large scale datas,&rdquo; in <em>Proc. IEEE International
+  Conference on Acoustics, Speech, and Signal Processing (ICASSP)</em>, 2020.
+
+</td>
+</tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="e2e2020">34</a>]
+</td>
+<td class="bibtexitem">
+T.&nbsp;Sainath, Y.&nbsp;He, B.&nbsp;Li, A.&nbsp;Narayanan, R.&nbsp;Pang, A.&nbsp;Bruguier, S.&nbsp;yiin Chang,
+  W.&nbsp;Li, R.&nbsp;Alvarez, Z.&nbsp;Chen, C.&nbsp;cheng Chiu, D.&nbsp;Garcia, A.&nbsp;Gruenstein, K.&nbsp;Hu,
+  M.&nbsp;Jin, A.&nbsp;Kannan, Q.&nbsp;Liang, I.&nbsp;McGraw, C.&nbsp;Peyser, R.&nbsp;Prabhavalkar,
+  G.&nbsp;Pundak, D.&nbsp;Rybach, Y.&nbsp;Shangguan, Y.&nbsp;Sheth, T.&nbsp;Strohman, M.&nbsp;Visontai,
+  Y.&nbsp;Wu, Y.&nbsp;Zhang, and D.&nbsp;Zhao, &ldquo;A streaming on-device end-to-end model
+  surpassing server-side conventional model quality and latency,&rdquo; in <em>
+  Proc. IEEE International Conference on Acoustics, Speech, and Signal
+  Processing (ICASSP)</em>, 2020.
+
+</td>
+</tr>
 </table>
 
 ## Language understanding
@@ -599,6 +760,23 @@ P.&nbsp;Haghani, A.&nbsp;Narayanan, M.&nbsp;Bacchiani, G.&nbsp;Chuang, N.&nbsp;G
   to End-to-End Spoken Language Understanding,&rdquo; in <em>Proc. IEEE Spoken
   Language Technology Workshop (SLT)</em>, 2018.
 [&nbsp;<a href="https://arxiv.org/abs/1809.09190">pdf</a>&nbsp;]
+
+</td>
+</tr>
+
+
+<tr valign="top">
+<td align="right" class="bibtexnumber">
+[<a name="chen2019smartcompose">4</a>]
+</td>
+<td class="bibtexitem">
+M.&nbsp;X. Chen, B.&nbsp;N. Lee, G.&nbsp;Bansal, Y.&nbsp;Cao, S.&nbsp;Zhang, J.&nbsp;Lu, J.&nbsp;Tsay, Y.&nbsp;Wang,
+  A.&nbsp;M. Dai, Z.&nbsp;Chen, T.&nbsp;Sohn, and Y.&nbsp;Wu, &ldquo;Gmail smart compose: Real-time
+  assisted writing,&rdquo; in <em>Proceedings of the 25th ACM SIGKDD International
+  Conference on Knowledge Discovery & Data Mining</em>, Association for Computing
+  Machinery, 2019.
+[&nbsp;<a href="https://arxiv.org/abs/1906.00080">pdf</a>&nbsp;| 
+<a href="https://dl.acm.org/doi/10.1145/3292500.3330723">http</a>&nbsp;]
 
 </td>
 </tr>

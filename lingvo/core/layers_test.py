@@ -1434,6 +1434,43 @@ class PoolingLayerTest(test_utils.TestCase):
         self.assertAllClose(predicted_out_shape, output1_v.shape)
 
 
+class BlurPoolLayerTest(test_utils.TestCase):
+
+  def _testBlurPool(self, subsample_type, blur_filter, expected_output):
+    with self.session(use_gpu=True):
+      p = layers.BlurPoolLayer.Params().Set(
+          name='blur_pool',
+          input_channels=3,
+          subsample_type=subsample_type,
+          blur_filter=blur_filter)
+
+      layer = p.Instantiate()
+      in_padding1 = tf.convert_to_tensor([[0, 0, 0, 1], [0, 0, 1, 1]],
+                                         dtype=tf.float32)
+      expected_out_padding = [[0, 1], [0, 1]]
+      inputs1 = tf.constant(
+          np.arange(24, dtype='float32').reshape([2, 4, 1, 3]),
+          dtype=tf.float32)
+
+      output1, out_padding1 = layer.FPropDefaultTheta(inputs1, in_padding1)
+      tf.global_variables_initializer().run()
+      print([np.array_repr(output1.eval())])
+      self.assertAllClose(expected_output, output1.eval())
+      self.assertAllClose(expected_out_padding, out_padding1.eval())
+
+  def testBlurPool1D(self):
+    expected_output = np.array([[[[1.125, 1.8125, 2.5]], [[0, 0, 0]]],
+                                [[[8.25, 8.875, 9.5]], [[0, 0, 0]]]],
+                               dtype=np.float32)
+    self._testBlurPool('1D', 'B5', expected_output)
+
+  def testBlurPool2D(self):
+    expected_output = np.array([[[[0.421875, 0.6796875, 0.9375]], [[0, 0, 0]]],
+                                [[[3.09375, 3.328125, 3.5625]], [[0, 0, 0]]]],
+                               dtype=np.float32)
+    self._testBlurPool('2D', 'B5', expected_output)
+
+
 class ProjectionLayerTest(test_utils.TestCase):
 
   def testProjectionLayerConstruction(self):
@@ -2527,6 +2564,27 @@ class EmbeddingLayerTest(test_utils.TestCase):
       # pylint: enable=bad-whitespace
       self.assertAllClose(expected_output / np.sqrt(p.embedding_dim),
                           actual_position_embs)
+
+  def testRelativePositionalEmbeddingLayer(self):
+    with self.session(use_gpu=False) as sess:
+      radius = 3
+      p = layers.RelativePositionalEmbeddingLayer.Params().Set(
+          name='rel_position_emb', radius=radius, dim=4)
+      layer = p.Instantiate()
+      indices = np.array([-5, -2, 0, 1, 4], dtype=np.int32)
+      pos_emb = layer.FPropDefaultTheta(tf.convert_to_tensor(indices))
+
+      tf.global_variables_initializer().run()
+      actual_pos_emb, full_emb = sess.run([pos_emb, layer.vars.w])
+
+      clipped_indices = np.vectorize(lambda x: max(-radius, min(radius, x)))(
+          indices) + radius
+      expected_output = np.take_along_axis(full_emb,
+                                           np.expand_dims(clipped_indices, -1),
+                                           0)
+      print('expected_position_embs:', expected_output)
+      print('actual_position_embs:', actual_pos_emb)
+      self.assertAllClose(actual_pos_emb, expected_output)
 
   def testOneHotEmbeddingLayer(self):
     with self.session(use_gpu=True):

@@ -128,7 +128,6 @@ def _FromGlobal(field_name):
 
 
 ENQUEUE_OPS = '__lingvo_enqueue_ops'
-CLOSE_QUEUE_OPS = '__lingvo_close_queue_ops'
 
 TPU_EMBEDDING_LOAD_OPS = '__lingvo_tpu_embedding_load_ops'
 TPU_EMBEDDING_RETRIEVE_OPS = '__lingvo_tpu_embedding_retrieve_ops'
@@ -727,7 +726,7 @@ class NestedMap(dict):
       return default
 
   def Set(self, key, value):
-    """Sets the value for a nested key, returns `default` if key does not exist.
+    """Sets the value for a nested key.
 
     Note that indexing lists is not supported, names with underscores will be
     considered as one key.
@@ -2218,7 +2217,7 @@ def AdjustGradientsWithLpLoss(var_grads, lp_regularizer_weight, p=2.0):
   ]
   filtered_vars = Transform(GetVar, filtered_var_grads)
   for v in filtered_vars:
-    tf.logging.info('AdjustGradientsWithLpLoss: %s', v)
+    tf.logging.info('AdjustGradientsWithLpLoss: %s', v.name)
 
   if p == 2.0:
     lp_loss = 0.5 * lp_regularizer_weight * SumSquared(filtered_vars)

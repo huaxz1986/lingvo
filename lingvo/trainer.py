@@ -196,14 +196,14 @@ FLAGS = tf.flags.FLAGS
 
 # Map from split size to computation_shape for TPU model parallelism.
 SUPPORTED_SPLIT_SIZE = {
-    1: [1, 1, 1],
-    2: [1, 1, 2],
-    4: [1, 2, 2],
-    8: [2, 2, 2],
-    16: [4, 2, 2],
-    32: [4, 4, 2],
-    64: [4, 8, 2],
-    128: [8, 8, 2]
+    1: [1, 1, 1, 1],
+    2: [1, 1, 1, 2],
+    4: [1, 2, 1, 2],
+    8: [2, 2, 1, 2],
+    16: [4, 2, 1, 2],
+    32: [4, 4, 1, 2],
+    64: [4, 8, 1, 2],
+    128: [8, 8, 1, 2]
 }
 
 
@@ -266,6 +266,7 @@ class Controller(base_runner.BaseRunner):
 
   def __init__(self, *args, **kwargs):
     super(Controller, self).__init__(*args, **kwargs)
+    self._job_name = 'controller'
     assert not self._model_task_name, 'Controller needs all tasks!'
     self._control_dir = os.path.join(self._logdir, 'control')
     tf.gfile.MakeDirs(self._control_dir)
@@ -380,6 +381,7 @@ class Trainer(base_runner.BaseRunner):
 
   def __init__(self, *args, **kwargs):
     super(Trainer, self).__init__(*args, **kwargs)
+    self._job_name = 'trainer'
     with self._graph.as_default(), tf.container(self._container_id):
       with self._cluster, tf.device(self._cluster.GetPlacer()):
         self._model = self.params.Instantiate()
@@ -486,12 +488,14 @@ class Trainer(base_runner.BaseRunner):
             except AttributeError:
               pass
 
-        (_, global_step, eval_metrics, per_example_tensors) = sess.run([
+        (_, eval_metrics, per_example_tensors) = sess.run([
             model_task.train_op,
-            py_utils.GetGlobalStep(),
             model_task.eval_metrics,
             model_task.per_example_tensors,
         ])
+        # Explicitly fetch global_step after running train_op.
+        # TODO(b/151181934): Investigate this behavior further.
+        global_step = sess.run(py_utils.GetGlobalStep())
         model_task.ProcessFPropResults(sess, global_step, eval_metrics,
                                        per_example_tensors)
 
@@ -524,6 +528,7 @@ class TrainerTpu(base_runner.BaseRunner):
 
   def __init__(self, *args, **kwargs):
     super(TrainerTpu, self).__init__(*args, **kwargs)
+    self._job_name = 'trainer_tpu'
 
     # Multiple TPU trainer tasks not tested/implemented.
     assert self._cluster.num_replicas == 1

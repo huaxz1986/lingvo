@@ -64,10 +64,9 @@ tf.flags.DEFINE_string(
     'xla_device', '', 'If non-empty, can be cpu, gpu, or tpu (case sensitive)')
 
 tf.flags.DEFINE_bool(
-    'use_resource_var', False,
-    'Use ResourceVariable instead of Variable; this option is '
-    'ignored when xla_device=tpu, as TPU requires resource '
-    'variables')
+    'use_resource_var', True,
+    'Use ResourceVariable instead of RefVariable; this option is '
+    'enabled by default and will be removed in the future.')
 
 tf.flags.DEFINE_bool(
     'tpu_compatible', False, 'Create variables in a way compatible with TPU. '
@@ -4001,3 +4000,25 @@ def TopK(x_in, k):
     return out_values[0], out_indices[0]
   else:
     return tf.concat(out_values, x_rank - 1), tf.concat(out_indices, x_rank - 1)
+
+
+def ReadVariable(var_op):
+  """Returns the value of the given variable operation.
+
+  Args:
+    var_op: The variable's TF `Operation`. It could be one of VarHandleOp,
+      Variable and VariableV2.
+
+  Returns:
+    A `Tensor` containing the value of the variable.
+  """
+  if var_op.type == 'VarHandleOp':
+    # Filter out the ReadVariableOps that have control dependencies to avoid
+    # side-effects when the user runs it.
+    filter_fn = lambda op: op.type == 'ReadVariableOp' and not op.control_inputs
+    var_readers = list(filter(filter_fn, var_op.outputs[0].consumers()))
+    assert var_readers
+    return var_readers[0].outputs[0]
+
+  assert var_op.type in ['Variable', 'VariableV2']
+  return var_op.outputs[0]

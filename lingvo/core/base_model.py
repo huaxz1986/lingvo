@@ -84,6 +84,8 @@ class BaseTask(base_layer.BaseLayer):
     p.Define('train', hyperparams.Params(),
              'Params to control how this task should be trained.')
 
+    p.Define('ml_perf', hyperparams.Params(), 'MlPerf configuration.')
+
     tp = p.train
     tp.Define(
         'start_up_delay_steps', 200, 'i-th replica starts training after '

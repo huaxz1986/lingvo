@@ -30,6 +30,7 @@ from lingvo.core import checkpointer
 from lingvo.core import cluster_factory
 from lingvo.core import hyperparams
 from lingvo.core import metrics
+from lingvo.core import ml_perf_log as mlp_log
 from lingvo.core import py_utils
 from lingvo.core import summary_utils
 import six
@@ -37,6 +38,8 @@ from six.moves import range
 from six.moves import zip
 
 # pylint:disable=g-direct-tensorflow-import
+from tensorflow.core.protobuf.tpu import compilation_result_pb2 as tpu_compilation_result
+from tensorflow.python.tpu import tpu
 from tensorflow.python.tpu import tpu_function
 from tensorflow.python.tpu import training_loop as tpu_training_loop
 from tensorflow.python.tpu.ops import tpu_ops
@@ -73,14 +76,23 @@ class BaseProgram(object):
     p.Define('name', 'base_program', 'Program name.')
     p.Define('task_name', None,
              'If multi-task, what the high-level task name is')
+    p.Define('ml_perf', None, 'MLPerf config')
+
     return p
 
   def __init__(self, params):
     self.params = params.Copy()
     p = self.params
     self._task_params = p.task
+    if p.ml_perf is not None and p.ml_perf.benchmark_name is not None:
+      self._ml_perf_log = True
+      self._ml_perf = p.ml_perf
+      self._ml_perf_epoch = -1
+    else:
+      self._ml_perf_log = False
     self._logdir = p.logdir
     self._task_name = p.task_name
+    self._program_name = ''
 
     # Program dirs are where the summaries are written to.
     if p.task_name:
@@ -102,6 +114,8 @@ class BaseProgram(object):
 
     # Thread Pool for infeed.
     self._infeed_pool = multiprocessing.dummy.Pool(1)
+
+    self._compile_op = None
 
   def _SummarizeValue(self, steps, tag, value):
     self._summary_writer.add_summary(
@@ -125,6 +139,18 @@ class BaseProgram(object):
     @tpu_function.on_device_training_loop etc.
     """
     raise NotImplementedError()
+
+  def Compile(self, sess):
+    """Compile the program using the given session handle."""
+    if self._compile_op is not None:
+      tf.logging.info('Compiling %s', self._program_name)
+      result = sess.run(self._compile_op)
+      proto = tpu_compilation_result.CompilationResultProto()
+      proto.ParseFromString(result)
+      if proto.status_error_message:
+        tf.logging.fatal('Compilation failed: {}'.format(
+            proto.status_error_message))
+      tf.logging.info('Compiling %s done.', self._program_name)
 
   def Run(self, sess):
     """Execute the program using the given session handle."""
@@ -150,6 +176,7 @@ class TrainProgram(BaseProgram):
   def __init__(self, params):
     super(TrainProgram, self).__init__(params)
     self._step_rate_tracker = summary_utils.StepRateTracker()
+    self._program_name = 'TrainProgram'
 
   def _OutfeedEnqueue(self, per_example_tensors):
     if not per_example_tensors:
@@ -234,6 +261,16 @@ class TrainProgram(BaseProgram):
 
   def BuildTpuSubgraph(self):
     tf.logging.info('TrainProgram BuildTpuSubGraph')
+    if self._ml_perf_log:
+      mlp_log.mlperf_print('global_batch_size', self._ml_perf.global_batch_size)
+      mlp_log.mlperf_print('max_sequence_length',
+                           self._ml_perf.max_sequence_length)
+      mlp_log.mlperf_print('opt_name', self._ml_perf.optimizer_name)
+      mlp_log.mlperf_print('opt_base_learning_rate',
+                           self._ml_perf.base_learning_rate)
+      mlp_log.mlperf_print('opt_learning_rate_warmup_steps',
+                           self._ml_perf.warmup_steps)
+
     with py_utils.OpportunisticVariableReuseScope(True):
       self._eval_metrics = metrics.TpuEvalMetrics()
       data_parallelism = self.data_parallelism
@@ -270,7 +307,7 @@ class TrainProgram(BaseProgram):
         # Final metrics are the avg across self._steps_per_loop steps.
         return self._eval_metrics.FinalizeMetrics(loop_result)
 
-      batch_parallel_res = tf.tpu.batch_parallel(
+      self._compile_op, batch_parallel_res = tpu.split_compile_and_shard(
           TpuTrain,
           num_shards=data_parallelism,
           device_assignment=py_utils.GetTpuDeviceAssignment())
@@ -285,6 +322,20 @@ class TrainProgram(BaseProgram):
   def Run(self, sess):
     tf.logging.info('Executing train program for %s.', self._task_name)
     gsteps = py_utils.GetGlobalStep()
+
+    global_step = sess.run(gsteps)
+    if self._ml_perf_log:
+      steps_per_epoch = self._ml_perf.steps_per_epoch
+      epoch = int(global_step) // steps_per_epoch
+      if epoch > self._ml_perf_epoch:
+        self._ml_perf_epoch = epoch
+        mlp_log.mlperf_print(
+            'block_start',
+            None,
+            metadata={
+                'first_epoch_num': epoch + 1,
+                'epoch_count': 1
+            })
 
     infeed_future = self._infeed_pool.apply_async(
         self._InfeedLoop, args=(sess,))
@@ -322,6 +373,10 @@ class EvalProgram(BaseProgram):
   evaluation.
   """
 
+  def __init__(self, params):
+    super(EvalProgram, self).__init__(params)
+    self._program_name = 'EvalProgram'
+
   def BuildTpuSubgraph(self):
     tf.logging.info('EvalProgram BuildTpuSubGraph')
     with py_utils.OpportunisticVariableReuseScope(True):
@@ -357,7 +412,7 @@ class EvalProgram(BaseProgram):
         # Final metrics are the avg across self._steps_per_loop steps.
         return self._eval_metrics.FinalizeMetrics(loop_result)
 
-      batch_parallel_res = tf.tpu.batch_parallel(
+      self._compile_op, batch_parallel_res = tpu.split_compile_and_shard(
           TpuEval,
           num_shards=data_parallelism,
           device_assignment=py_utils.GetTpuDeviceAssignment())
@@ -389,6 +444,10 @@ class DecodeProgram(BaseProgram):
   decoder run.
   """
 
+  def __init__(self, params):
+    super(DecodeProgram, self).__init__(params)
+    self._program_name = 'DecodeProgram'
+
   def _WriteSummaries(self, job_name, global_step, summaries):
     for unused_name, summary in sorted(summaries.items()):
       self._summary_writer.add_summary(summary, global_step)
@@ -413,7 +472,7 @@ class DecodeProgram(BaseProgram):
           self.metrics_nm = py_utils.NestedMap(metrics_dict)
           return self.metrics_nm.Flatten()
 
-    batch_parallel_res = tf.tpu.batch_parallel(
+    self._compile_op, batch_parallel_res = tpu.split_compile_and_shard(
         _DecodeFn,
         num_shards=self.data_parallelism,
         device_assignment=py_utils.GetTpuDeviceAssignment())
@@ -426,6 +485,12 @@ class DecodeProgram(BaseProgram):
     tf.logging.info('Executing decode program for %s.', self._task_name)
     gsteps = py_utils.GetGlobalStep()
     global_step = sess.run(gsteps)
+
+    if self._ml_perf_log:
+      steps_per_epoch = self._ml_perf.steps_per_epoch
+      epoch = int(global_step) // steps_per_epoch
+      mlp_log.mlperf_print(
+          'eval_start', None, metadata={'epoch_num': (epoch + 1)})
 
     infeed_future = self._infeed_pool.apply_async(
         self._InfeedLoop, args=(sess,))
@@ -441,6 +506,11 @@ class DecodeProgram(BaseProgram):
       if decode_out:
         buffered_decode_out.extend(decode_out)
     infeed_future.wait()
+
+    if self._ml_perf_log:
+      mlp_log.mlperf_print(
+          'eval_stop', None, metadata={'epoch_num': (epoch + 1)})
+
     num_examples_metric = dec_metrics['num_samples_in_batch']
     summaries = {k: v.Summary(k) for k, v in six.iteritems(dec_metrics)}
     elapsed_secs = time.time() - start_time
@@ -454,6 +524,16 @@ class DecodeProgram(BaseProgram):
     decode_finalize_args = base_model.DecodeFinalizeArgs(
         decode_out_path=decode_out_path, decode_out=buffered_decode_out)
     self._model_task.DecodeFinalize(decode_finalize_args)
+
+    if self._ml_perf_log:
+      mlperf_metric = self._ml_perf.decoder_metric_name
+      mlperf_metric_value = dec_metrics[mlperf_metric].value
+      mlp_log.mlperf_print(
+          'eval_accuracy', mlperf_metric_value, metadata={'epoch_num': epoch})
+      if mlperf_metric_value > self._ml_perf.decoder_metric_success_threshold:
+        tf.logging.info('ml_perf_final_threshold: %f exceeded',
+                        self._ml_perf.decoder_metric_success_threshold)
+        mlp_log.mlperf_print('run_stop', None, metadata={'status': 'success'})
 
 
 class MultiTaskProgramSchedule(object):
@@ -487,6 +567,21 @@ class SimpleProgramSchedule(object):
     p.Define('eval_programs', [], 'List of eval program params.')
     p.Define('num_splits_per_client', None, '')
     p.Define('dataset_names', [], 'List of all dataset names.')
+
+    p.Define('ml_perf', hyperparams.Params(), 'MlPerf configuration.')
+
+    mlp = p.ml_perf
+    mlp.Define('benchmark_name', None, 'Benchmark name for compliance log.')
+    mlp.Define('decoder_metric_name', None,
+               'Name of the decoder metric to report for compliance log.')
+    mlp.Define('decoder_metric_success_threshold', None,
+               'Benchmark run must exceed this value to succeeed.')
+    mlp.Define('steps_per_epoch', None, 'Number of training steps per epoch.')
+    mlp.Define('global_batch_size', None, 'Global batch size.')
+    mlp.Define('max_sequence_length', None, 'Maximum sequence length.')
+    mlp.Define('optimizer_name', None, 'Optimizer used.')
+    mlp.Define('base_learning_rate', None, 'Base learning rate.')
+    mlp.Define('warmup_steps', None, 'Number of warm-up steps.')
     return p
 
   def __init__(self, params):
@@ -501,12 +596,14 @@ class SimpleProgramSchedule(object):
     p.train_program.task = p.task_dict[p.train_program.dataset_name]
     p.train_program.num_splits_per_client = p.num_splits_per_client
     p.train_program.task_name = p.task_name
+    p.train_program.ml_perf = p.ml_perf.Copy()
 
     for eval_program_params in p.eval_programs:
       eval_program_params.logdir = p.logdir
       eval_program_params.task = p.task_dict[eval_program_params.dataset_name]
       eval_program_params.task_name = p.task_name
       eval_program_params.num_splits_per_client = p.num_splits_per_client
+      eval_program_params.ml_perf = p.ml_perf.Copy()
 
     self.eval_programs = []
     self.train_program = p.train_program.Instantiate()

@@ -21,11 +21,13 @@ from __future__ import print_function
 
 import os
 
+
 from lingvo import base_runner
 from lingvo import compat as tf
 from lingvo.core import base_model
 from lingvo.core import checkpointer
 from lingvo.core import cluster_factory
+from lingvo.core import ml_perf_log as mlp_log
 from lingvo.core import multitask_model
 from lingvo.core import py_utils
 from lingvo.core import task_scheduler
@@ -132,6 +134,7 @@ class ExecutorTpu(base_runner.BaseRunner):
     """
     super(ExecutorTpu, self).__init__(train_cfg, model_task_name, logdir,
                                       tf_master, **kwargs)
+
     self._cluster_def = self._cluster.worker_cluster_def
 
     # There is a single Executor task
@@ -147,6 +150,8 @@ class ExecutorTpu(base_runner.BaseRunner):
     self._checkpoint_dir = os.path.join(logdir, 'train')
 
     self._variable_renaming_rules = []
+
+    self._ml_perf = None
 
     # If this is a multi-task model, grab the params for the TaskScheduler.
     if issubclass(train_cfg.cls, base_model.SingleTaskModel):
@@ -189,8 +194,16 @@ class ExecutorTpu(base_runner.BaseRunner):
       tf.logging.info('program_schedule_params: %s',
                       program_schedule_params.ToText())
       self._programs += ps.Programs()
+      if program_schedule_params.ml_perf.benchmark_name is not None:
+        self._ml_perf = program_schedule_params.ml_perf
 
     tf.logging.info('num_programs: %d', len(self._programs))
+
+    if self._ml_perf is not None:
+      self._ml_perf_log = True
+      mlp_log.mlperf_print(key='benchmark', value=self._ml_perf.benchmark_name)
+    else:
+      self._ml_perf_log = False
 
     # BaseRunner legacy
     self.enqueue_ops = None
@@ -245,6 +258,8 @@ class ExecutorTpu(base_runner.BaseRunner):
         tf.logging.info('TPU initialization failed: %s', e)
         raise
 
+    if self._ml_perf_log:
+      mlp_log.mlperf_print(key='init_start', value=None)
     _WaitTillInit()
 
     with self._graph.as_default(), tf.container(self._container_id):
@@ -275,12 +290,15 @@ class ExecutorTpu(base_runner.BaseRunner):
       # Initialize the variables first, if needed.
       for program in self._programs:
         program.RestoreIfNeeded(sess)
+        program.Compile(sess)
       sess.run(self._initialize_tables)
       sess.run(self._initialize_local_vars)
 
+      if self._ml_perf_log:
+        # Post-initialize/compile.
+        mlp_log.mlperf_print(key='run_start', value=None)
       while True:
         global_step = sess.run(py_utils.GetGlobalStep())
-
         if self._ShouldStop(sess, global_step):
           tf.logging.info('Training finished.')
           self.save_only_checkpointer.Save(sess, global_step)

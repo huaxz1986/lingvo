@@ -90,6 +90,9 @@ class BaseInputGenerator(base_layer.BaseLayer):
     # Each entry is a regular expression specifying the set of variables
     # to bprop per data source.
     self._bprop_variable_filters = ['']
+    # For executor-driven multiple programs, we need more fine-grained
+    # access rather than using a single global graph collection.
+    self._tpu_infeed_op = None
 
   def CommonInputOpArgs(self):
     """Common input params."""
@@ -300,13 +303,18 @@ class BaseInputGenerator(base_layer.BaseLayer):
     for _ in range(p.tpu_infeed_parallelism):
       tf.add_to_collection(py_utils.ENQUEUE_OPS, tpu_infeed_op)
 
-    # For executor-driven multiple programs, we need more fine-grained
-    # access rather than using a single global graph collection.
-    self.tpu_infeed_op = tpu_infeed_op
+    self._tpu_infeed_op = tpu_infeed_op
 
     with tf.device(tf.tpu.core(0)):
       tensors = queues[0].generate_dequeue_op()
     return batch.Pack(tensors)
+
+  @property
+  def tpu_infeed_op(self):
+    if self._tpu_infeed_op is not None:
+      return self._tpu_infeed_op
+    else:
+      raise ValueError('TPU infeed not found. Call CreateTpuFeeds first.')
 
   def SplitInputBatch(self, num_splits):
     """Splits the current InputBatch into num_splits ways.
@@ -669,16 +677,10 @@ class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
     return self._scaled_bucket_batch_limit
 
   def GlobalBatchSize(self):
-    p = self.params
     # TODO(rpang): rename self._input_batch_size to _global_input_batch_size.
     if self._input_batch_size is None:
       raise ValueError('No input batch size is defined.')
-    global_batch_size = self._input_batch_size
-    cluster = self.cluster
-    if p.use_per_host_infeed and cluster.num_tpu_hosts > 0:
-      global_batch_size *= cluster.num_tpu_hosts
-    tf.logging.info('GlobalBatchSize {}'.format(global_batch_size))
-    return global_batch_size
+    return self._input_batch_size
 
   def InfeedBatchSize(self):
     p = self.params

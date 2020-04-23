@@ -1,4 +1,4 @@
-# Lint as: python2, python3
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,9 +15,6 @@
 # ==============================================================================
 """Tests for py_utils."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import collections
 import copy
@@ -419,6 +416,17 @@ class PyUtilsTest(test_utils.TestCase):
       x = tf.constant([[1, 2], [3, 4]])
       y = tf.constant([10] * 4)
       x = py_utils.Log(x, 'testLog', x=x, y=y)
+      self.assertAllEqual(x.eval(), [[1, 2], [3, 4]])
+
+  def testDebug(self):
+    with self.session():
+      x = tf.constant([[1, 2], [3, 4]])
+      y = tf.constant([11] * 4)
+      z = tf.constant([22] * 4)
+      x = py_utils.Debug(x, 'msg')
+      self.assertAllEqual(x.eval(), [[1, 2], [3, 4]])
+
+      x = py_utils.Debug(x, 'msg', more=[y, z])
       self.assertAllEqual(x.eval(), [[1, 2], [3, 4]])
 
   def testSave(self):

@@ -15,7 +15,6 @@
 # ==============================================================================
 """Tests for generic_input_op."""
 
-
 import collections
 import os
 import pickle
@@ -208,6 +207,58 @@ class GenericInputOpTest(test_utils.TestCase, parameterized.TestCase):
       self.assertAlmostEqual(source_id_count[0] / num_records, 0.2, delta=0.01)
       self.assertAlmostEqual(source_id_count[1] / num_records, 0.3, delta=0.01)
       self.assertAlmostEqual(source_id_count[2] / num_records, 0.5, delta=0.01)
+
+  def testBoolDType(self):
+    tmp = os.path.join(tf.test.get_temp_dir(), 'bool')
+    with tf.python_io.TFRecordWriter(tmp) as w:
+      for i in range(50):
+        w.write(pickle.dumps(True if i % 2 == 0 else False))
+
+    g = tf.Graph()
+    with g.as_default():
+      # A record processor written in TF graph.
+      def _process(record):
+        bucket_key = 1
+        num, = tf.py_func(pickle.loads, [record], [tf.bool])
+        return [num], bucket_key
+
+      # Samples random records from the data files and processes them
+      # to generate batches.
+      inputs, _ = self.get_test_input(
+          tmp, bucket_upper_bound=[1], processor=_process)
+
+    with self.session(graph=g) as sess:
+      for _ in range(10):
+        inputs_vals = sess.run(inputs)[0]
+        self.assertEqual(inputs_vals.dtype, bool)
+
+  def testExtraArgs(self):
+
+    def _parse_record(record):
+      del record
+      example = py_utils.NestedMap(t=tf.convert_to_tensor(0))
+      bucketing_key = 1
+      return example, bucketing_key
+
+    def _parse_record_stateful(record):
+      del record
+      extra = tf.Variable(0)
+      example = py_utils.NestedMap(t=extra.value())
+      bucketing_key = 1
+      return example, bucketing_key
+
+    generic_input.GenericInput(
+        _parse_record,
+        file_pattern='',
+        bucket_upper_bound=[1],
+        bucket_batch_limit=[1])
+
+    with self.assertRaisesRegex(AssertionError, 'is not pure: extra_args='):
+      generic_input.GenericInput(
+          _parse_record_stateful,
+          file_pattern='',
+          bucket_upper_bound=[1],
+          bucket_batch_limit=[1])
 
 
 if __name__ == '__main__':

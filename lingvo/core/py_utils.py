@@ -619,13 +619,17 @@ def GetTpuDeviceAssignment():
   return _tpu_device_assignment
 
 
-def SessionConfig(soft_placement=True, inline=True, cluster_def=None):
+def SessionConfig(soft_placement=True,
+                  inline=True,
+                  cluster_def=None,
+                  disable_meta_optimizer=False):
   """Returns a session config proto.
 
   Args:
     soft_placement: Turns allow_soft_placement on iff True.
     inline: Turns do_function_inlining on iff True.
     cluster_def: A tf.train.ClusterDef describing the cluster.
+    disable_meta_optimizer: Turns off grappler/metagraph optimizer.
 
   Returns:
     A TF session config proto.
@@ -636,6 +640,10 @@ def SessionConfig(soft_placement=True, inline=True, cluster_def=None):
           optimizer_options=tf.OptimizerOptions(
               opt_level=tf.OptimizerOptions.L1, do_function_inlining=inline)),
       cluster_def=cluster_def)
+
+  if disable_meta_optimizer:
+    # Useful if start-up time is critical.
+    session_config.graph_options.rewrite_options.disable_meta_optimizer = True
   # Disable layout optimizer which increases GPU memory usage.
   session_config.graph_options.rewrite_options.layout_optimizer = (
       rewriter_config_pb2.RewriterConfig.OFF)
@@ -4226,6 +4234,38 @@ def GetTpuSummaryTensors():
       '%s/%s' % (x.name, SanitizeScopeKey(x.name_scope)): x.value
       for x in tpu_summary_tensors
   }
+
+
+def ComputationShape(split_size):
+  """Decides the computation shape based on the split_size."""
+  computation_shape = None
+  if split_size == 1:
+    computation_shape = [1, 1, 1, 1]
+  elif split_size == 2:
+    computation_shape = [1, 1, 1, 2]
+  elif split_size == 4:
+    computation_shape = [1, 2, 1, 2]
+  elif split_size == 8:
+    computation_shape = [2, 2, 1, 2]
+  elif split_size == 16:
+    computation_shape = [4, 2, 1, 2]
+  elif split_size == 32:
+    computation_shape = [4, 4, 1, 2]
+  elif split_size == 64:
+    computation_shape = [4, 8, 1, 2]
+  elif split_size == 128:
+    computation_shape = [8, 8, 1, 2]
+  elif split_size == 256:
+    computation_shape = [8, 16, 1, 2]
+  elif split_size == 512:
+    computation_shape = [16, 16, 1, 2]
+  elif split_size == 2048:
+    computation_shape = [32, 32, 1, 2]
+  else:
+    assert False, ('Model parallelism with %d devices is currently not'
+                   ' supported.' % split_size)
+  assert computation_shape is not None
+  return computation_shape
 
 
 def GetExtraVars():

@@ -1093,6 +1093,7 @@ py_test(
         ":symbolic",
         ":test_helper",
         ":test_utils",
+        # Implicit absl.testing.flagsaver dependency.
         "//lingvo:compat",
         "//lingvo:model_registry",
         "//lingvo/tasks/image/params:mnist",
@@ -1951,5 +1952,32 @@ py_test(
     deps = [
         ":ml_perf_log",
         "//lingvo:compat",
+    ],
+)
+
+py_library(
+    name = "egdd",
+    srcs = [
+        "egdd.py",
+    ],
+    srcs_version = "PY2AND3",
+    deps = [
+        # Implicit numpy dependency.
+        # Implicit six dependency.
+        # Implicit tensorflow dependency.
+    ],
+)
+
+py_test(
+    name = "egdd_test",
+    size = "large",
+    srcs = ["egdd_test.py"],
+    python_version = "PY3",
+    srcs_version = "PY3",
+    deps = [
+        ":egdd",
+        # Implicit numpy dependency.
+        # Implicit six dependency.
+        # Implicit tensorflow dependency.
     ],
 )

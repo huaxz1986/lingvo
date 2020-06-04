@@ -104,7 +104,11 @@ def ExtractBlockContext(x,
   return tf.concat(concat_list, axis=2)
 
 
-def MakeCausalPadding(seq_len, block_size, left_context, right_context):
+def MakeCausalPadding(seq_len,
+                      block_size,
+                      left_context,
+                      right_context,
+                      dtype=tf.float32):
   """Makes the causal padding tensor for a full sequence.
 
   Args:
@@ -112,6 +116,7 @@ def MakeCausalPadding(seq_len, block_size, left_context, right_context):
     block_size: int. Number of time frames in a block.
     left_context: int. Left context size.
     right_context: int. Right context size.
+    dtype: tf.dtype, default is tf.float32.
 
   Returns:
     A tensor of [num_blocks, block_size, context_size] taking values in {0, 1},
@@ -156,7 +161,7 @@ def MakeCausalPadding(seq_len, block_size, left_context, right_context):
   valid_atten &= tf.math.logical_and(valid_src[:, :, tf.newaxis],
                                      valid_tgt[:, tf.newaxis, :])
 
-  padding = 1.0 - tf.cast(valid_atten, dtype=tf.float32)
+  padding = 1.0 - tf.cast(valid_atten, dtype=dtype)
 
   return padding
 
@@ -182,8 +187,7 @@ def RelShift(x):
   return x
 
 
-# TODO(rpang): remove is_causal from the API.
-def RelPositionBias(content, abs_pos_emb, is_causal):
+def RelPositionBias(content, abs_pos_emb):
   """Compute relative position bias.
 
   This is a subroutine used by variants of self-attentions with relative
@@ -203,13 +207,10 @@ def RelPositionBias(content, abs_pos_emb, is_causal):
     content:         [B, T, N, H]
     abs_pos_emb:     [2T - 1, N, H], the absolute positional embedding.
       abs_pos_emb[i] is the emb of relative distance i - (T-1).
-    is_causal: A Python bool or a scalar bool Tensor. True for causal self
-      attention.
 
   Returns:
     The attention logits tensor. [B, N, T, T]
   """
-  del is_causal
   b, t, n, h = py_utils.GetShape(content)
   l = 2 * t - 1
   abs_pos_emb = py_utils.HasShape(abs_pos_emb, [l, n, h])
@@ -228,8 +229,7 @@ def _AttenLogits(query,
                  key,
                  abs_pos_emb,
                  content_bias=None,
-                 positional_bias=None,
-                 is_causal=False):
+                 positional_bias=None):
   """Attention logits from ...
 
   Transformer-XL(https://arxiv.org/pdf/1901.02860.pdf, section 3.3) version of
@@ -251,8 +251,6 @@ def _AttenLogits(query,
     distance i - (T-1).
     content_bias:    [N, H] or None
     positional_bias: [N, H] or None
-    is_causal: A Python bool or a scalar bool Tensor. True for causal self
-    attention.
 
   Returns:
     The attention logits tensor. [B, N, T, T]
@@ -273,16 +271,12 @@ def _AttenLogits(query,
   with tf.name_scope('term_ac'):
     term_ac = tf.einsum('BTNH,BSNH->BNTS', query + content_bias, key)
   with tf.name_scope('term_bd'):
-    term_bd = RelPositionBias(query + positional_bias, abs_pos_emb, is_causal)
+    term_bd = RelPositionBias(query + positional_bias, abs_pos_emb)
   return term_ac + term_bd
 
 
-def AttenLogitsTransformerXL(query,
-                             key,
-                             abs_pos_emb,
-                             content_bias,
-                             positional_bias,
-                             is_causal=False):
+def AttenLogitsTransformerXL(query, key, abs_pos_emb, content_bias,
+                             positional_bias):
   """Attention logits from ...
 
   Transformer-XL(https://arxiv.org/pdf/1901.02860.pdf, section 3.3) version of
@@ -304,17 +298,14 @@ def AttenLogitsTransformerXL(query,
     distance i - (T-1).
     content_bias:    [N, H]
     positional_bias: [N, H]
-    is_causal: A Python bool or a scalar bool Tensor. True for causal self
-    attention.
 
   Returns:
     The attention logits tensor. [B, N, T, T]
   """
-  return _AttenLogits(query, key, abs_pos_emb, content_bias, positional_bias,
-                      is_causal)
+  return _AttenLogits(query, key, abs_pos_emb, content_bias, positional_bias)
 
 
-def AttenLogitsRPE(query, key, abs_pos_emb, is_causal):
+def AttenLogitsRPE(query, key, abs_pos_emb):
   """Attention logits from ...
 
   https://arxiv.org/pdf/1803.02155.pdf with trainable rel position emb.
@@ -332,10 +323,8 @@ def AttenLogitsRPE(query, key, abs_pos_emb, is_causal):
     key:             [B, T, N, H]
     abs_pos_emb:     [2T - 1, N, H]. The trainable embdding. abs_pos_emb[i] is
       the emb of relative distance i - (T-1).
-    is_causal: A Python bool or a scalar bool Tensor. True for causal self
-      attention.
 
   Returns:
     The attention logits tensor. [B, N, T, T]
   """
-  return _AttenLogits(query, key, abs_pos_emb, is_causal=is_causal)
+  return _AttenLogits(query, key, abs_pos_emb)

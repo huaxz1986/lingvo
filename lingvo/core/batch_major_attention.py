@@ -733,6 +733,8 @@ class MultiHeadedAttentionXL(MultiHeadedAttention):
     p = super(MultiHeadedAttentionXL, cls).Params()
     p.Define('rel_pos_emb_dim', None,
              'Dimension of relative positional embedding.')
+    p.Define('skip_term_b', False,
+             'If True, skip term_b in the paper section 3.3.')
     return p
 
   @base_layer.initializer
@@ -791,7 +793,7 @@ class MultiHeadedAttentionXL(MultiHeadedAttention):
     sin_emb = tf.squeeze(sin_emb, 0)
 
     logits = relative_atten_util.AttenLogitsTransformerXL(
-        query, key, sin_emb, theta.u, theta.v)
+        query, key, sin_emb, theta.u, theta.v, self.params.skip_term_b)
     return logits
 
   def _AttenLogitsOneStep(self, theta, query, key, time_step):
@@ -827,7 +829,10 @@ class MultiHeadedAttentionXL(MultiHeadedAttention):
     sin_emb = tf.squeeze(sin_emb, 0)
 
     # term b an d.
-    logits += tf.einsum('BNH,SNH->SBN', query + theta.v, sin_emb)
+    if not p.skip_term_b:
+      logits += tf.einsum('BNH,SNH->SBN', query + theta.v, sin_emb)
+    else:
+      logits += tf.expand_dims(tf.einsum('NH,SNH->SN', theta.v, sin_emb), 1)
     return logits
 
   def ExtendStep(self,
@@ -1281,6 +1286,8 @@ class LocalCausalSelfAttentionXL(LocalCausalSelfAttention):
     p = super(LocalCausalSelfAttentionXL, cls).Params()
     p.Define('rel_pos_emb_dim', None,
              'Dimension of relative positional embedding.')
+    p.Define('skip_term_b', False,
+             'If True, skip term_b in the paper section 3.3.')
     return p
 
   @base_layer.initializer
@@ -1339,21 +1346,35 @@ class LocalCausalSelfAttentionXL(LocalCausalSelfAttention):
     # [F, N, H]
     sin_emb = tf.squeeze(sin_emb, 0)
 
-    # [B, N, U, W, F]
-    term_bd = tf.einsum('BUWNH,FNH->BNUWF', query + theta.v, sin_emb)
+    p = self.params
+    if not p.skip_term_b:
+      # [B, N, U, W, F]
+      term_bd = tf.einsum('BUWNH,FNH->BNUWF', query + theta.v, sin_emb)
 
-    # Perform relative shift in order to get [B, N, U, W, C]
-    # Pads the input to [B, N, U, C, C+1]
-    term_bd = tf.pad(term_bd,
-                     ((0, 0), (0, 0), (0, 0), (0, c - w), (0, c + 1 - f)))
+      # Perform relative shift in order to get [B, N, U, W, C]
+      # Pads the input to [B, N, U, C, C+1]
+      term_bd = tf.pad(term_bd,
+                       ((0, 0), (0, 0), (0, 0), (0, c - w), (0, c + 1 - f)))
 
-    # Reshapes to [B, N, U, C+1, C]. Note the output last dim is 1-smaller
-    # than the input, which "pushses" one element off to the next row for each
-    # row. The accumulated effect is row_i is right-shifted i steps (i>=0).
-    term_bd = tf.reshape(term_bd, [b, n, u, c + 1, c])
+      # Reshapes to [B, N, U, C+1, C]. Note the output last dim is 1-smaller
+      # than the input, which "pushses" one element off to the next row for each
+      # row. The accumulated effect is row_i is right-shifted i steps (i>=0).
+      term_bd = tf.reshape(term_bd, [b, n, u, c + 1, c])
 
-    # Keeps useful slices. [B, N, U, W, C]
-    term_bd = tf.slice(term_bd, [0, 0, 0, 0, 0], [-1, -1, -1, w, -1])
+      # Keeps useful slices. [B, N, U, W, C]
+      term_bd = tf.slice(term_bd, [0, 0, 0, 0, 0], [-1, -1, -1, w, -1])
+    else:
+      # [N, F]
+      term_d = tf.einsum('NH,FNH->NF', theta.v, sin_emb)
+      # [N, W, F]
+      term_d = tf.tile(tf.expand_dims(term_d, 1), [1, w, 1])
+      # [N, C, C+1]
+      term_d = tf.pad(term_d, ((0, 0), (0, c - w), (0, c + 1 - f)))
+      # [N, C+1, C]
+      term_d = tf.reshape(term_d, [n, c + 1, c])
+      # Keeps useful slices. [N, W, C]
+      term_d = tf.slice(term_d, [0, 0, 0], [-1, w, -1])
+      term_bd = tf.reshape(term_d, [1, n, 1, w, c])
     return term_ac + term_bd
 
 
@@ -1868,7 +1889,9 @@ def ClearRelativeAttentionInTransformerLayer(transformer_params):
     raise ValueError('Unsupported attention params: %s' % attention_tpl.cls)
 
   new_attention_tpl = hyperparams.CopyParamsTo(
-      attention_tpl, new_attention_tpl, skip=['cls', 'rel_pos_emb_dim'])
+      attention_tpl,
+      new_attention_tpl,
+      skip=['cls', 'rel_pos_emb_dim', 'skip_term_b'])
   trans_params_copy.tr_self_atten_tpl.atten_tpl = new_attention_tpl
   return trans_params_copy
 

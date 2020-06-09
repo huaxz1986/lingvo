@@ -48,6 +48,49 @@ class AddingAccumulator(base_layer.Accumulator):
     self.SetValue(self.GetValue() + tf.cast(value, self.dtype))
 
 
+def ComputeMomentsWithPadding(inputs,
+                              padding,
+                              reduce_over_dims,
+                              enable_cross_replica_sum_on_tpu=False,
+                              keepdims=False):
+  """Computes mean and variance over the valid data points in inputs."""
+  mask = 1.0 - padding
+  inputs = py_utils.with_dependencies([
+      py_utils.assert_equal(tf.rank(inputs), tf.rank(mask)),
+      py_utils.assert_greater_equal(mask, tf.zeros_like(mask)),
+  ], inputs)
+  sum_v = tf.reduce_sum(
+      inputs * tf.cast(mask, inputs.dtype), reduce_over_dims, keepdims=keepdims)
+  count_v = tf.reduce_sum(mask, reduce_over_dims, keepdims=keepdims)
+  # Input shape is guaranteed to be a multiple of mask shape because the
+  # inputs * mask op above was successfully broadcasted.
+  input_size_on_reduced_dims = tf.reduce_prod(
+      tf.gather(tf.shape(inputs), reduce_over_dims))
+  mask_size_on_reduced_dims = tf.reduce_prod(
+      tf.gather(tf.shape(mask), reduce_over_dims))
+  mask_multiplier = tf.math.truediv(input_size_on_reduced_dims,
+                                    mask_size_on_reduced_dims)
+  count_v *= tf.cast(mask_multiplier, count_v.dtype)
+  if py_utils.use_tpu() and enable_cross_replica_sum_on_tpu:
+    sum_v = tf.tpu.cross_replica_sum(sum_v)
+    count_v = tf.tpu.cross_replica_sum(count_v)
+
+  count_v = tf.maximum(count_v, 1.0)
+  mean = sum_v / count_v
+  sum_vv = tf.reduce_sum(
+      (inputs - mean) * (inputs - mean) * mask,
+      reduce_over_dims,
+      keepdims=keepdims)
+
+  if py_utils.use_tpu() and enable_cross_replica_sum_on_tpu:
+    sum_vv = tf.tpu.cross_replica_sum(sum_vv)
+
+  variance = py_utils.with_dependencies([
+      py_utils.assert_greater_equal(sum_vv, tf.zeros_like(sum_vv)),
+  ], sum_vv / count_v)
+  return mean, variance
+
+
 class BatchNormLayer(base_layer.BaseLayer):
   """Batch normalization layer."""
 
@@ -159,39 +202,6 @@ class BatchNormLayer(base_layer.BaseLayer):
   def epsilon(self):
     return self._epsilon
 
-  @staticmethod
-  def _Moments(inputs, mask, enable_cross_replica_sum_on_tpu=False):
-    """Computes mean and variance over the valid data points in inputs."""
-    inputs = py_utils.with_dependencies([
-        py_utils.assert_equal(tf.rank(inputs), tf.rank(mask)),
-        py_utils.assert_greater_equal(mask, tf.zeros_like(mask)),
-    ], inputs)
-    rank = tf.rank(mask)
-    reduce_over_dims = tf.range(0, rank - 1)
-    sum_v = tf.reduce_sum(inputs * tf.cast(mask, inputs.dtype),
-                          reduce_over_dims)
-    count_v = tf.reduce_sum(mask, reduce_over_dims)
-    # Input shape is guaranteed to be a multiple of mask shape because the
-    # inputs * mask op above was successfully broadcasted.
-    mask_multiplier = tf.shape(inputs)[:-1] // tf.shape(mask)[:-1]
-    count_v *= tf.cast(tf.reduce_prod(mask_multiplier), count_v.dtype)
-    if py_utils.use_tpu() and enable_cross_replica_sum_on_tpu:
-      sum_v = tf.tpu.cross_replica_sum(sum_v)
-      count_v = tf.tpu.cross_replica_sum(count_v)
-
-    count_v = tf.maximum(count_v, 1.0)
-    mean = sum_v / count_v
-    sum_vv = tf.reduce_sum((inputs - mean) * (inputs - mean) * mask,
-                           reduce_over_dims)
-
-    if py_utils.use_tpu() and enable_cross_replica_sum_on_tpu:
-      sum_vv = tf.tpu.cross_replica_sum(sum_vv)
-
-    variance = py_utils.with_dependencies([
-        py_utils.assert_greater_equal(sum_vv, tf.zeros_like(sum_vv)),
-    ], sum_vv / count_v)
-    return mean, variance
-
   def _GetDefaultPaddings(self, inputs):
     """Gets the default paddings for an input."""
     return tf.zeros(
@@ -238,8 +248,11 @@ class BatchNormLayer(base_layer.BaseLayer):
         norm_mean, norm_variance = (self.vars.moving_mean,
                                     self.vars.moving_variance)
       else:
-        mean, variance = self._Moments(inputs, 1.0 - paddings,
-                                       p.enable_cross_replica_sum_on_tpu)
+        rank = tf.rank(paddings)
+        reduce_over_dims = tf.range(0, rank - 1)
+        mean, variance = ComputeMomentsWithPadding(
+            inputs, paddings, reduce_over_dims,
+            p.enable_cross_replica_sum_on_tpu)
 
         py_utils.UpdateBatchNormVars(self.vars.moving_mean, mean, self._decay)
         py_utils.UpdateBatchNormVars(self.vars.moving_variance, variance,
@@ -527,3 +540,112 @@ class BatchNormLayerNoPadding(base_layer.BaseLayer):
     return py_utils.NestedMap(
         flops=inputs.num_elements() * _BN_FLOPS_PER_ELEMENT,
         out_shapes=(inputs,))
+
+
+class GroupNormLayer(base_layer.BaseLayer):
+  """Group normalization layer(https://arxiv.org/abs/1803.08494)."""
+
+  @classmethod
+  def Params(cls):
+    p = super(GroupNormLayer, cls).Params()
+    p.Define('dim', 0, 'Depth of the input/output.')
+    p.Define('num_groups', 32, 'Number of groups for GroupNorm.')
+    p.Define('min_group_size', 1, 'Minimum group size for GroupNorm')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(GroupNormLayer, self).__init__(params)
+    p = self.params
+    assert p.name
+    assert p.num_groups > 0
+    assert p.min_group_size > 0
+    if p.dim >= p.num_groups:
+      assert p.dim % p.num_groups == 0, ('p.dim({0}) is not dividable by '
+                                         'p.num_groups({1})').format(
+                                             p.dim, p.num_groups)
+
+    collections = [
+        self.__class__.__name__ + '_vars', py_utils.SKIP_LP_REGULARIZATION
+    ]
+
+    pc = py_utils.WeightParams(
+        shape=[1, 1, 1, p.dim],
+        init=py_utils.WeightInit.Constant(0.0),
+        dtype=p.dtype,
+        collections=collections)
+
+    with tf.variable_scope(p.name):
+      self.CreateVariable('beta', pc)
+      # Note, The real gamma to use is 1 + gamma.
+      self.CreateVariable('gamma', pc, lambda x: 1.0 + x)
+
+    self._epsilon = 0.001
+
+  def FProp(self, theta, inputs, paddings=None):
+    """Apply group normalization.
+
+    Args:
+      theta: A NestedMap object containing weights' values of this layer and its
+        children layers.
+      inputs: The inputs tensor with shape [batch_size, height, width, channel].
+      paddings: The paddings tensor with shape [batch_size, height]. Intended to
+        be used for sequence processing where `height` is `time`.
+
+    Returns:
+      A single tensor as the output after applying group normalization, with
+      the same shape as 'inputs'. Or a output, output_paddings pair if input
+      paddings is not None.
+    """
+    p = self.params
+    n, h, w, c = tf.unstack(tf.shape(inputs), axis=0, num=4)
+    group_size = p.dim // p.num_groups
+    num_groups = p.num_groups
+    min_group_size = p.min_group_size if p.dim > p.min_group_size else p.dim
+    if group_size <= min_group_size:
+      group_size = min_group_size
+      num_groups = p.dim // group_size
+
+    with tf.name_scope(p.name):
+      x = tf.reshape(inputs, [n, h, w, num_groups, group_size])
+      if paddings is None:
+        counts, means_ss, variance_ss, _, = tf.nn.sufficient_statistics(
+            x, axes=[1, 2, 4], keepdims=True)
+        norm_mean, norm_variance = tf.nn.normalize_moments(
+            counts, means_ss, variance_ss, None)
+      else:
+        expanded_paddings = tf.reshape(paddings, [n, h, 1, 1, 1])
+        norm_mean, norm_variance = ComputeMomentsWithPadding(
+            x, expanded_paddings, [1, 2, 4], keepdims=True)
+
+      norm_mean = py_utils.CheckNumerics(
+          norm_mean, 'mean of %s failed numeric check' % p.name)
+      norm_variance = py_utils.CheckNumerics(
+          norm_variance, 'variance of %s failed numeric check' % p.name)
+
+      beta = theta.beta
+      gamma = theta.gamma
+
+      with tf.control_dependencies([
+          py_utils.assert_greater_equal(norm_variance,
+                                        tf.cast(0., norm_variance.dtype)),
+          py_utils.assert_shape_match([n, 1, 1, num_groups, 1],
+                                      tf.shape(norm_mean)),
+          py_utils.assert_shape_match([n, 1, 1, num_groups, 1],
+                                      tf.shape(norm_variance)),
+      ]):
+        x = (x - norm_mean) / tf.sqrt(norm_variance + self._epsilon)
+        x = tf.reshape(x, [n, h, w, c])
+        gn_output = x * gamma + beta
+        gn_output = tf.reshape(gn_output, [n, h, w, c])
+        if paddings is None:
+          return gn_output
+        else:
+          return gn_output, paddings
+
+  @classmethod
+  def FPropMeta(cls, p, inputs):
+    py_utils.CheckShapes((inputs,))
+    flops_per_element = 10  # Approximately 10 flops per element.
+    return py_utils.NestedMap(
+        flops=inputs.num_elements() * flops_per_element, out_shapes=(inputs,))

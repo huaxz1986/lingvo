@@ -97,22 +97,22 @@ class ParamsTest(test_utils.TestCase):
     self.assertIs(outer.inner.tensor, outer_copy.inner.tensor)
     self.assertIs(outer.inner.symbol, outer_copy.inner.symbol)
 
-  def testCopyParamsTo(self):
+  def testCopyFieldsTo(self):
     source = _params.Params()
     dest = _params.Params()
     source.Define('a', 'a', '')
     source.Define('b', 'b', '')
     source.Define('c', 'c', '')
     dest.Define('a', '', '')
-    _params.CopyParamsTo(source, dest, skip=['b', 'c'])
+    _params.CopyFieldsTo(source, dest, skip=['b', 'c'])
     self.assertEqual(source.a, dest.a)
     self.assertNotIn('b', dest)
     self.assertNotIn('c', dest)
 
-  def testCopyParamsToDoesNotCopyClass(self):
+  def testCopyFieldsToDoesNotCopyClass(self):
     source = _params.InstantiableParams(cls=_params.Params)
     dest = _params.InstantiableParams(cls=_params.InstantiableParams)
-    _params.CopyParamsTo(source, dest)
+    _params.CopyFieldsTo(source, dest)
     self.assertEqual(dest.cls, _params.InstantiableParams)
 
   def testDefineExisting(self):
@@ -396,6 +396,7 @@ tuple : (2, 3)
 
     rebuilt_outer = _params.InstantiableParams.FromProto(outer.ToProto())
 
+    self.assertNotIn('cls', rebuilt_outer)
     self.assertEqual(outer.integer_val, rebuilt_outer.integer_val)
     self.assertEqual(outer.cls_type, rebuilt_outer.cls_type)
     self.assertNear(outer.inner.float_val, rebuilt_outer.inner.float_val, 1e-6)

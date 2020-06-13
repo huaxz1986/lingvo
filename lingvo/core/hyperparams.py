@@ -169,8 +169,8 @@ class _Param(object):
     return self._value
 
 
-def CopyParamsTo(from_p, to_p, skip=None):
-  """Copy from one Params to another, with optional skipped params.
+def CopyFieldsTo(from_p, to_p, skip=None):
+  """Copy fields from one Params to another, with optional skipped params.
 
   Preserves `type(to_p.Instantiate())`. Use `from_p.Copy()` instead if requiring
   a deep copy of `from_p`, without updating `to_p`.
@@ -179,7 +179,7 @@ def CopyParamsTo(from_p, to_p, skip=None):
     from_p: Source params to copy from.
     to_p: Destination params to copy to.
     skip: If not None, a list of strings of param names to skip. Automatically
-        skips InstantiableParams' 'cls' parameter.
+      skips InstantiableParams' 'cls' parameter.
 
   Returns:
     None
@@ -596,6 +596,7 @@ class Params(object):
 
     return _ToParam(self)
 
+  # TODO(tonybruguier): Move to module-level function (cls is never used).
   @classmethod
   def FromProto(cls, param_pb):
     """Reads from a Hyperparams proto."""
@@ -659,7 +660,7 @@ class Params(object):
     def _FromParam(param_pb):
       """Deserializes Hyperparam proto."""
 
-      params = InstantiableParams()
+      params = InstantiableParams() if 'cls' in param_pb.items else Params()
       for k in param_pb.items:
         val = _FromParamValue(param_pb.items[k])
         if k == 'cls':

@@ -867,7 +867,7 @@ class NestedMap(dict):
         current = current[k]
 
   def _RecursiveMap(self, fn, flatten=False):
-    """Traverse recursively into lists and NestedMaps applying `fn`.
+    """Traverse recursively into lists, dicts, and NestedMaps applying `fn`.
 
     Args:
       fn: The function to apply to each item (leaf node).
@@ -880,8 +880,8 @@ class NestedMap(dict):
 
     def Recurse(v, key=''):
       """Helper function for _RecursiveMap."""
-      if isinstance(v, NestedMap):
-        ret = [] if flatten else NestedMap()
+      if isinstance(v, dict):
+        ret = [] if flatten else type(v)()
         deleted = False
         for k in sorted(v.keys()):
           res = Recurse(v[k], key + '.' + k if key else k)
@@ -924,8 +924,8 @@ class NestedMap(dict):
   def Flatten(self):
     """Returns a list containing the flattened values in the `.NestedMap`.
 
-    Unlike py_utils.Flatten(), this will only descend into lists and NestedMaps
-    and not dicts, tuples, or namedtuples.
+    Unlike py_utils.Flatten(), this will only descend into lists, dicts, and
+    NestedMaps and not tuples, or namedtuples.
     """
     return self._RecursiveMap(lambda _, v: v, flatten=True)
 
@@ -1357,6 +1357,8 @@ class _CollectionGetter(object):
 
 def SanitizeScopeKey(key):
   """Removes invalid symbols from name_scope keys."""
+  if key.startswith('_'):
+    key = key[1:]
   return key.replace('[', '_').replace(']', '')
 
 
@@ -2692,10 +2694,13 @@ def VariationalNoiseParams(scale,
   return p
 
 
+def DefaultVN():
+  return VariationalNoiseParams(None, False, False)
+
+
 # To disable VN of a layer, we use 1.0 in the first input parameter
 # of the following function because otherwise it is the same to DefaultVN()
-# configuration of base_layer, which will be updated by parent configuration in
-# CopyBaseParams()
+# which will be updated by parent configuration in CopyBaseParams()
 def DisableVN():
   return VariationalNoiseParams(1.0, False, False)
 

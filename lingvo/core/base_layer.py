@@ -19,6 +19,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import abc
+import itertools
 import re
 import threading
 import lingvo.compat as tf
@@ -112,32 +114,30 @@ def initializer(func):  # pylint: disable=invalid-name
     __init__() for classes on the class hierarchy.
   """
 
-  def wrapper(self, *args, **kwargs):  # pylint: disable=invalid-name
-    # Push back self (the current layer) to the stack.
+  def Wrapper(self, *args, **kwargs):
+    """Decorator wrapper fn."""
     stack = _LAYER_STACK.layer_stack
-    should_pop = False
-    if not stack or stack[-1] is not self:
-      stack.append(self)
-      should_pop = True
+    if stack and stack[-1] is self:
+      # Short circuit if called multiple times (eg. super() chain).
+      func(self, *args, **kwargs)
+      return
+
+    # Push back self (the current layer) to the stack.
+    stack_size = len(stack)
+    stack.append(self)
     try:
       # Calls the layer's real __init__ method.
       func(self, *args, **kwargs)
-      # pylint: disable=protected-access
-      self._CheckInvariants()
-      assert id(stack[-1]) == id(self)
-      if len(stack) > 1 and id(stack[-2]) != id(self):
-        # Records the fact stack[-1] just created a sub-layer self.
-        stack[-2]._AutoAddChild(self)
+      if len(stack) > 1:
+        # Records the fact stack[-2] just created a sub-layer self.
+        stack[-2]._AutoAddChild(self)  # pylint: disable=protected-access
     finally:
       # Pop out self (the current layer).
-      if should_pop:
-        stack.pop()
+      assert stack[-1] is self
+      stack.pop()
+      assert len(stack) == stack_size
 
-  return wrapper
-
-
-def DefaultVN():
-  return py_utils.VariationalNoiseParams(None, False, False)
+  return Wrapper
 
 
 def RecursiveFindLayerParams(params):
@@ -159,9 +159,40 @@ def RecursiveFindLayerParams(params):
   return layer_params
 
 
+class BaseLayerMeta(type):
+  """Metaclass tracking child layers and variable initialization."""
+
+  # pylint: disable=bad-mcs-classmethod-argument
+  def __new__(mcs, name, bases, dct):
+    cls = super(BaseLayerMeta, mcs).__new__(mcs, name, bases, dct)
+    if '__init__' not in dct:
+
+      def TrivialInit(self, params):
+        super(cls, self).__init__(params)  # pylint: disable=bad-super-call
+
+      cls.__init__ = TrivialInit
+
+    cls.__init__ = initializer(cls.__init__)
+    return cls
+
+  # pylint: enable=bad-mcs-classmethod-argument
+
+  def __call__(cls, *args, **kwargs):
+    self = super(BaseLayerMeta, cls).__call__(*args, **kwargs)
+    # This happens after self.__init__()
+    self._CheckInvariants()  # pylint: disable=protected-access
+    self._disable_create_child = True  # pylint: disable=protected-access
+    return self
+
+
+class ABCLayerMeta(BaseLayerMeta, abc.ABCMeta):
+  pass
+
+
 LAYER_WT = 'layer_weight_variable'
 
 
+@six.add_metaclass(BaseLayerMeta)
 class BaseLayer(tf.Module):
   """Base class for all the layer object.
 
@@ -195,7 +226,8 @@ class BaseLayer(tf.Module):
     p.Define(
         'random_seed', None, 'Random seed for deterministic unittests. This '
         'is inherited by child layers if they do not set a random_seed.')
-    p.Define('vn', DefaultVN(), 'How variational noise should be applied.')
+    p.Define('vn', py_utils.DefaultVN(),
+             'How variational noise should be applied.')
     p.Define(
         'params_init', py_utils.DefaultParamInit(),
         'How model weights should be initialized. Not to be confused with '
@@ -239,7 +271,7 @@ class BaseLayer(tf.Module):
       to_params.skip_lp_regularization = from_params.skip_lp_regularization
 
     # Only copy from base when vn config is using the default setting.
-    if to_params.vn == DefaultVN():
+    if to_params.vn == py_utils.DefaultVN():
       to_params.vn = from_params.vn.Copy()
 
     # TODO(rpang): derive to_params.params_init.seed from
@@ -252,9 +284,6 @@ class BaseLayer(tf.Module):
 
   def __init__(self, params):
     """Layer constructor.
-
-    Sub-classes of BaseLayer should decorator its __init__ with
-    @base_layer.initializer
 
     Args:
       params: A params used to construct this layer.
@@ -280,10 +309,11 @@ class BaseLayer(tf.Module):
     # debugged more and understood better.
     self._setattr_tracking = False
 
-    self._parent = (
-        _LAYER_STACK.layer_stack[-2]
-        if len(_LAYER_STACK.layer_stack) > 1 else None)
-    assert self._parent is not self
+    self._parent = None
+    for parent in reversed(_LAYER_STACK.layer_stack):
+      if parent is not self:
+        self._parent = parent
+        break
     self._params = params.Copy()
     tf.logging.debug('Creating layer %s with params: \n %s \n',
                           self.__class__.__name__, str(params))
@@ -307,7 +337,7 @@ class BaseLayer(tf.Module):
     # Mapping from variable names to its symbolic shape.
     # self._var_symbolic_shape_map['var_name'] will be a tuple of integers or
     # symbolic expressions, one for each dimension of the variable.
-    self._var_symbolic_shape_map = dict()
+    self._var_symbolic_shape_map = {}
 
     self.AddExtraTheta('global_step', py_utils.GetGlobalStep())
 
@@ -422,9 +452,9 @@ class BaseLayer(tf.Module):
   def __getattr__(self, name):
     """Returns the child layer of the given name."""
     if name == '_private_children':
-      raise AttributeError(
-          'pre-mature access to __getattr__ before _private_children '
-          'is created.')
+      # Raising AttributeError without custom message triggers normal python
+      # handling of __getattr__ AttributeError.
+      raise AttributeError()
     if name in self._private_children:
       return self._private_children[name]
     elif (hasattr(type(self), name) and
@@ -653,8 +683,8 @@ class BaseLayer(tf.Module):
           collections=(var_params.collections +
                        [py_utils.SKIP_LP_REGULARIZATION]))
     self._var_symbolic_shape_map[name] = var_params.shape
-    value, var = py_utils.CreateVariable(
-        name, var_params, default_seed=self.params.random_seed, **kwargs)
+    kwargs.setdefault('default_seed', self.params.random_seed)
+    value, var = py_utils.CreateVariable(name, var_params, **kwargs)
     self._private_vars[name] = var
     if theta_fn is not None:
       value = theta_fn(value)
@@ -686,6 +716,8 @@ class BaseLayer(tf.Module):
       name: Sub layer name which is used as the key into vars/theta.
       params: `Hyperparams` object to instantiate a layer.
     """
+    if hasattr(self, '_disable_create_child') and self._disable_create_child:
+      raise ValueError('Attempting to call CreateChild outside of __init__.')
     self._CheckName(name)
     if not params.name:
       params.name = name
@@ -693,8 +725,8 @@ class BaseLayer(tf.Module):
     child = p.Instantiate()
     self._private_children[name] = child
 
-  def CreateChildren(self, name, params_list, child_scopes=None):
-    """Create a list of sub layers.
+  def CreateChildren(self, name, params):
+    """Create a list or dict of sub layers.
 
     The created sub layer list can be accessed by `name`. E.g.::
 
@@ -707,46 +739,28 @@ class BaseLayer(tf.Module):
         self.children.foo[10].Fprop...
 
     Args:
-      name: The name for the sub layers, which is used as the key
-        into vars/theta.
-      params_list: `Hyperparams` objects to instantiate a list of layers.
-      child_scopes: If not none, a variable_scope to set for each child.
+      name: The name for the sub layers, which is used as the key into
+        vars/theta.
+      params: a list or dict of `Hyperparams` objects to create.
     """
+    if hasattr(self, '_disable_create_child') and self._disable_create_child:
+      raise ValueError('Attempting to call CreateChildren outside of __init__.')
     self._CheckName(name)
 
-    def CreateChildrenHelper(params_list, child_scopes):
-      """Helper to create children recursively."""
-      if child_scopes and len(child_scopes) != len(params_list):
-        raise ValueError('child_scopes must be same structure as params_list.')
-      children = []
-      for i, p in enumerate(params_list):
-        if isinstance(p, list):
-          children.append(
-              CreateChildrenHelper(p,
-                                   child_scopes[i] if child_scopes else None))
-        else:
-          p = self.CopyBaseParams(self.params, p.Copy())
-          if not p.name:
-            p.name = '%s_%d' % (name, i)
-          if child_scopes:
-            with tf.variable_scope(child_scopes[i]):
-              children.append(p.Instantiate())
-          else:
-            children.append(p.Instantiate())
-      return children
+    uid = itertools.count()
 
-    self._private_children[name] = CreateChildrenHelper(params_list,
-                                                        child_scopes)
+    def Instantiate(p):
+      p = self.CopyBaseParams(self.params, p.Copy())
+      if not p.name:
+        p.name = '%s_%d' % (name, next(uid))
+      return p.Instantiate()
 
-  def AddChild(self, name, child):
-    """Add an existing layer as a sublayer."""
-    assert isinstance(child, BaseLayer)
-    self._CheckName(name)
-    self._private_children[name] = child
+    self._private_children[name] = py_utils.NestedMap(
+        sub=params).Transform(Instantiate).sub
 
-  def AddChildren(self, name, children):
-    """Add existing layers as sublayers."""
-    for child in children:
+  def AddChild(self, name, children):
+    """Add existing layer or layers as sublayer."""
+    for child in py_utils.Flatten(children):
       assert isinstance(child, BaseLayer)
     self._CheckName(name)
     self._private_children[name] = children
@@ -754,8 +768,7 @@ class BaseLayer(tf.Module):
   def _AutoAddChild(self, child):
     """Record that a layer `child` is instantiated by this layer.
 
-    This is a method only called by `base_layer.initializer` decorator.
-    Subclasses should not call this method.
+    This method should only be called internally by BaseLayerMeta.
 
     Args:
       child: A sub-layer of this layer.
@@ -768,22 +781,15 @@ class BaseLayer(tf.Module):
 
   def _VerifyChildren(self):
     """Verify all children created by this layer are via `CreateChild(ren)`."""
-
-    def FindCreatedChildren(parents):
-      created_children = []
-      for v in parents:
-        if isinstance(v, (tuple, list)):
-          created_children.extend(FindCreatedChildren(v))
-        else:
-          created_children.append(v)
-      return created_children
-
-    created_children = FindCreatedChildren(
-        list(self._private_children.values()))
+    created_children = self._private_children.Flatten()
     for v in self._children_list:
-      assert v in created_children, (
-          '%s is not created by BaseLayer.CreateChild(ren) in %r.' %
-          (v.params.name, self))
+      if v not in created_children:
+        tf.logging.info([
+            (child.params.name, type(child)) for child in created_children
+        ])
+        raise ValueError(
+            '%s is not created by BaseLayer.CreateChild(ren) in %r.' %
+            (v.params.name, self))
 
   def _VerifyVarsAndTheta(self):
     """Verify that vars and theta have the same nested structure."""

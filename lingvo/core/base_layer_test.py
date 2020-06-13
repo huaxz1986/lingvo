@@ -92,13 +92,29 @@ class BaseLayerTest(test_utils.TestCase):
     layer_p = base_layer.BaseLayer.Params()
     layer_p.name = 'test'
     layer = layer_p.Instantiate()
-    layer.CreateChildren('a', [layer_p, [layer_p, layer_p], layer_p])
+    layer._disable_create_child = False  # pylint: disable=protected-access
+    layer.CreateChildren('a', [
+        layer_p,
+        [layer_p, layer_p],
+        {
+            'b': layer_p,
+            'c': {
+                'd': [layer_p, layer_p]
+            }
+        },
+    ])
     self.assertEqual(len(layer.a), 3)
     self.assertEqual(len(layer.a[1]), 2)
+    self.assertEqual(len(layer.a[2]), 2)
+    self.assertEqual(len(layer.a[2]['c']['d']), 2)
     self.assertEqual(len(layer.vars.a), 3)
     self.assertEqual(len(layer.vars.a[1]), 2)
+    self.assertEqual(len(layer.vars.a[2]), 2)
+    self.assertEqual(len(layer.vars.a[2]['c']['d']), 2)
     self.assertEqual(len(layer.theta.a), 3)
     self.assertEqual(len(layer.theta.a[1]), 2)
+    self.assertEqual(len(layer.theta.a[2]), 2)
+    self.assertEqual(len(layer.theta.a[2]['c']['d']), 2)
 
   def testCreateVariable(self):
     layer_p = TestLayer.Params().Set(name='test')
@@ -122,13 +138,19 @@ class BaseLayerTest(test_utils.TestCase):
   def testGetDescendant(self):
     q = base_layer.BaseLayer.Params()
     q.name = 'test'
+    # pylint: disable=protected-access
     l = q.Instantiate()
     p = base_layer.BaseLayer.Params()
+    l._disable_create_child = False
     l.CreateChild('a', p)
     l.CreateChild('b', p)
+    l.a._disable_create_child = False
     l.a.CreateChild('c', p)
+    l.a.c._disable_create_child = False
     l.a.c.CreateChild('d', p)
+    l.b._disable_create_child = False
     l.b.CreateChild('e', p)
+    # pylint: enable=protected-access
     self.assertEqual(l, l.GetDescendant(''))
     self.assertEqual(l.a, l.GetDescendant('a'))
     self.assertEqual(l.b, l.GetDescendant('b'))
@@ -140,6 +162,7 @@ class BaseLayerTest(test_utils.TestCase):
     layer_p = base_layer.BaseLayer.Params()
     layer_p.name = 'test'
     layer = layer_p.Instantiate()
+    layer._disable_create_child = False  # pylint: disable=protected-access
     layer.CreateChild('child', layer_p)
 
     # First accumulator should succeed.
@@ -208,8 +231,10 @@ class BaseLayerTest(test_utils.TestCase):
       layer_p = base_layer.BaseLayer.Params()
       layer_p.name = 'test'
       layer1 = layer_p.Instantiate()
+      layer1._disable_create_child = False  # pylint: disable=protected-access
       layer1.CreateChild('layer1a', layer_p)
       layer1.CreateChild('layer1b', layer_p)
+      layer1.layer1b._disable_create_child = False  # pylint: disable=protected-access
       layer1.layer1b.CreateChild('layer1b1', layer_p)
 
       # Create nested accumulators:
@@ -298,11 +323,6 @@ class BaseLayerTest(test_utils.TestCase):
     self.assertFalse(
         base_layer.IsLayerParams(
             hyperparams.InstantiableParams(base_layer.Accumulator)))
-
-  def testDefaultVnParams(self):
-    default_vn = base_layer.DefaultVN()
-    disable_vn = py_utils.DisableVN()
-    self.assertNotEqual(default_vn, disable_vn)
 
 
 if __name__ == '__main__':

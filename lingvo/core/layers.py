@@ -195,9 +195,6 @@ LOG_SCALE_CLAMP_BOUND = 20.0
 class IdentityLayer(base_layer.BaseLayer):
   """Identity layer, adds name and propagates its input."""
 
-  def __init__(self, params):
-    super(IdentityLayer, self).__init__(params)
-
   def FProp(self, theta, inputs, *args):
     """Identity mapping.
 
@@ -902,9 +899,11 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
     p.Define('apply_pruning', False,
              'Whether to prune the weights while training')
     p.Define(
-        'use_einsum', False, 'Whether to use tf.einsum for optimizing '
-        'computations. Might cause problems with model quantization for on '
-        'device inference b/146421936.')
+        'use_einsum', True, 'Whether to use tf.einsum for optimizing '
+        'computations. When this is set to False, this causes an increase in '
+        'TPU memory usage (b/158336491).  When this is set to True, it might '
+        ' cause problems with model quantization for on device inference '
+        '(b/146421936)')
     return p
 
   def __init__(self, params):
@@ -1157,6 +1156,25 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
 
     if b is not None:
       out += b  # NOTE: Bias on matmul is never quantized.
+    return self._ApplyActivationFunction(out, inputs, with_activation, quant)
+
+  def _ApplyActivationFunction(self,
+                               out,
+                               inputs,
+                               with_activation=True,
+                               quant=False):
+    """Applies the activation function in one step.
+
+    Args:
+      out: The result of applying the weight matrix (and bias) to the inputs.
+      inputs: FProp inputs.
+      with_activation: Whether to also compute the activation function.
+      quant: Whether to apply quantization.
+
+    Returns:
+      Output tensor reshaped.
+    """
+    p = self.params
     if with_activation and p.activation != 'NONE':
       if self._pre_activation_qt_name:
         # Track quantization for unfused activation function.
@@ -1894,8 +1912,7 @@ class EmbeddingLayer(base_layer.BaseLayer):
     with tf.variable_scope(p.name):
       for i in range(actual_shards):
         var_name = 'var_%d' % i
-        # TODO(b/158490758): remove default_seed=None setting.
-        self.CreateVariable(var_name, w_pc, default_seed=None)
+        self.CreateVariable(var_name, w_pc)
         emb_vars.append(self.vars[var_name])
         # NOTE: self.theta[var_name] has transformations such as variational
         # noise applied via theta_fn in self.CreateVariable. For embedding layer
@@ -2518,7 +2535,7 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
       embs *= p.embedding_dim**0.5
     return tf.reshape(embs, out_shape)
 
-  def FProp(self, theta, ids):
+  def _FlatFProp(self, theta, ids):
     """Lookups embedding vectors for ids.
 
     Args:
@@ -2526,8 +2543,8 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
       ids: A rank-N int32 tensor.
 
     Returns:
-      A rank-(N+1) params.dtype tensor.
-      embs[indices, :] is the embedding vector for ids[indices].
+      A tuple of the flattened inputs to the embedding lookup, and a tensor that
+      is ready to be reshaped into the final shape in FProp.
     """
     if not isinstance(ids, tf.Tensor):
       tf.logging.warning('ids should be a tf.Tensor!')
@@ -2541,7 +2558,8 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
           py_utils.assert_between(
               ids, 0, p.vocab_size, name='vocab_id_validation')
       ], ids)
-    embs_result = self._fprop(self.QWeight(theta.wm), tf.reshape(ids, [-1]))
+    flat_ids = tf.reshape(ids, [-1])
+    embs_result = self._fprop(self.QWeight(theta.wm), flat_ids)
     if p.vn.global_vn or p.vn.per_step_vn:
       emb_noise = p.vn.scale * tf.random.normal(
           tf.shape(embs_result),
@@ -2552,9 +2570,22 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
 
     if p.scale_sqrt_depth:
       embs_result *= p.embedding_dim**0.5
+    return flat_ids, embs_result
 
-    out_shape = tf.concat([tf.shape(ids), [symbolic.ToStatic(p.embedding_dim)]],
-                          0)
+  def FProp(self, theta, ids):
+    """Lookups embedding vectors for ids.
+
+    Args:
+      theta: Named tuple collection of weights for the layer.
+      ids: A rank-N int32 tensor.
+
+    Returns:
+      A rank-(N+1) params.dtype tensor.
+      embs[indices, :] is the embedding vector for ids[indices].
+    """
+    _, embs_result = self._FlatFProp(theta, ids)
+    out_shape = tf.concat(
+        [tf.shape(ids), [symbolic.ToStatic(self.params.embedding_dim)]], 0)
     return tf.reshape(embs_result, out_shape)
 
 
@@ -3031,7 +3062,7 @@ class SimpleFullSoftmax(SoftmaxLayer):
     new_theta.bias = py_utils.AddPerStepVN(p, tf.concat(biases, axis=0))
     return new_theta
 
-  def _LogitsUsingConcatenatedWeights(self, theta, inputs):
+  def _LogitsUsingConcatenatedWeightsHelper(self, theta, inputs):
     p = self.params
     inputs = self.QTensor('inputs', inputs)
     wm = self.QWeight(theta.wm)
@@ -3052,7 +3083,10 @@ class SimpleFullSoftmax(SoftmaxLayer):
     if abs_max is not None and not p.is_inference:
       abs_min = -abs_max  # pylint: disable=invalid-unary-operand-type
       logits = py_utils.clip_by_value(logits, abs_min, abs_max)
+    return logits
 
+  def _LogitsUsingConcatenatedWeights(self, theta, inputs):
+    logits = self._LogitsUsingConcatenatedWeightsHelper(theta, inputs)
     return self.QTensor('logits', logits)
 
   def SimpleLogits(self, theta, inputs):
@@ -4095,7 +4129,6 @@ class GradNormTracker(base_layer.BaseLayer):
         ' value.')
     return p
 
-  @base_layer.initializer
   def __init__(self, params):
     super(GradNormTracker, self).__init__(params)
     p = self.params
@@ -4708,12 +4741,18 @@ class MultitaskAdapterLayer(base_layer.BaseLayer):
         'Weight initialization for up and down projections. Only used for '
         'weights, not biases.  If None, uses default weight init, which is '
         'typically Xavier with scale of 1.0.')
+    p.Define(
+        'data_format', 'TBC', 'String(enum) specifying the input and output '
+        'data format for this layer. Supported formats: '
+        '"TBC": [time, batch, input_dim] and "BTC": [batch, time, input_dim].')
     return p
 
   def __init__(self, params):
     super(MultitaskAdapterLayer, self).__init__(params)
     p = self.params
     assert p.name
+    # Data format is either 'TBC' (time-major) or 'BTC' (batch-major).
+    assert p.data_format in ('TBC', 'BTC')
     with tf.variable_scope(p.name):
       base_emb_params = EmbeddingLayer.Params().Set(
           vocab_size=p.num_tasks, max_num_shards=1)
@@ -4747,35 +4786,40 @@ class MultitaskAdapterLayer(base_layer.BaseLayer):
     Args:
       theta: A NestedMap object containing weights' values of this layer and its
         children layers.
-      inputs: A tensor containing the activations from the previous layer of
-        shape [time, batch, input_dim].
+      inputs: A tensor containing the activations from the previous layer. For
+        'TBC', the shape is [time, batch, input_dim] and for 'BTC', it's
+        [batch, time, input_dim].
       tasks: An int32 tensor containing the task ID for each input.  If 'tasks'
-        is of rank 2, we assume it to be of shape [time, batch], indicating a
-        different task for each timestep.  In this case we look up adapter
-        params for each timestep.  If 'tasks' is of rank 1, we assume it to be
-        of shape [batch], indicating a single task for all timesteps of a
-        sequence.  This latter setup uses substantially less memory and is
-        generally preferred.
+        is of rank 2, we assume it to be of shape [time, batch] if 'BTC' and
+        [batch, time] if 'TBC', indicating a different task for each timestep.
+        In this case we look up adapter params for each timestep.  If 'tasks'
+        is of rank 1, we assume it to be of shape [batch], indicating a single
+        task for all timesteps of a sequence. This latter setup uses
+        substantially less memory and is generally preferred.
 
     Returns:
       A tensor containing the adapted activations with shape
-      [time, batch, input_dim].
+      [time, batch, input_dim] for 'TBC' and [batch, time, input_dim] for 'BTC'.
     """
     p = self.params
     inputs_shape = tf.shape(inputs)
+    per_timestep_task = (tasks.shape.ndims == 2)
+    batch_index = 1 if p.data_format == 'TBC' else 0
+    time_index = 1 - batch_index
     inputs = py_utils.with_dependencies(
         [
             # Checks that inputs has 3 dimensions, last is hidden dim.
             py_utils.assert_shape_match(inputs_shape, [-1, -1, p.input_dim]),
             # Checks that inputs and tasks have same batch dimension.
-            py_utils.assert_shape_match([inputs_shape[1]],
-                                        [tf.shape(tasks)[-1]])
+            py_utils.assert_shape_match([inputs_shape[batch_index]], [
+                tf.shape(tasks)[batch_index]
+                if per_timestep_task else tf.shape(tasks)[0]
+            ])
         ],
         inputs)
 
     # To support different task for each timetstep, flatten inputs and
     # tasks.  Below, 'batch' now refers to flattened batch size, time * batch.
-    per_timestep_task = (tasks.shape.ndims == 2)
     if per_timestep_task:
       tasks = py_utils.with_dependencies(
           [
@@ -4785,39 +4829,49 @@ class MultitaskAdapterLayer(base_layer.BaseLayer):
           ],
           tasks)
       tasks = tf.reshape(tasks, [-1])
-      inputs = tf.reshape(inputs, [1, -1, p.input_dim])
+      if p.data_format == 'TBC':
+        inputs = tf.reshape(inputs, [1, -1, p.input_dim])
+      else:
+        inputs = tf.reshape(inputs, [-1, 1, p.input_dim])
 
     # Lookup all weights and biases
     # [batch] -> [batch, hidden * k] -> [batch, hidden, k]
     down_weights = tf.reshape(
         self.down_proj_w.EmbLookup(theta.down_proj_w, tasks),
         [-1, p.input_dim, p.bottleneck_dim])
-    # [batch] -> [batch, k] -> [1, batch, k]
+    # [batch] -> [batch, k] -> [1, batch, k] if 'TBC' else [batch, 1, k]
     down_biases = tf.expand_dims(
-        self.down_proj_b.EmbLookup(theta.down_proj_b, tasks), 0)
+        self.down_proj_b.EmbLookup(theta.down_proj_b, tasks), time_index)
     # [batch] -> [batch, k * hidden] -> [batch, k, hidden]
     up_weights = tf.reshape(
         self.up_proj_w.EmbLookup(theta.up_proj_w, tasks),
         [-1, p.bottleneck_dim, p.input_dim])
-    # [batch] -> [batch, h] -> [1, batch, h]
+    # [batch] -> [batch, h] -> [1, batch, h] if 'TBC' else [batch, 1, h]
     up_biases = tf.expand_dims(
-        self.up_proj_b.EmbLookup(theta.up_proj_b, tasks), 0)
+        self.up_proj_b.EmbLookup(theta.up_proj_b, tasks), time_index)
 
     # Layer norm -> down-projection -> non-linearity -> up-projection
     norm_inputs = self.layer_norm.FProp(theta.layer_norm, inputs)
     # If per_timestep_task, t = 1, b = time * batch.
     # Otherwise, t = time, b = batch.
-    down_projected = tf.einsum('tbh,bhk->tbk', norm_inputs, down_weights)
+    if p.data_format == 'TBC':
+      down_projected = tf.einsum('tbh,bhk->tbk', norm_inputs, down_weights)
+    else:
+      down_projected = tf.einsum('bth,bhk->btk', norm_inputs, down_weights)
     down_projected += down_biases
     down_projected = tf.nn.relu(down_projected)
-    up_projected = tf.einsum('tbk,bkh->tbh', down_projected, up_weights)
+    if p.data_format == 'TBC':
+      up_projected = tf.einsum('tbk,bkh->tbh', down_projected, up_weights)
+    else:
+      up_projected = tf.einsum('btk,bkh->bth', down_projected, up_weights)
     up_projected += up_biases
     output = inputs + up_projected
 
-    # Unflatten output: [1, time * batch, hidden] -> [time, batch, hidden]
+    # Unflatten output:
+    #   for 'TBC': [1, time * batch, hidden] -> [time, batch, hidden]
+    #   for 'BTC': [1, batch * time, hidden] -> [batch, time, hidden]
     if per_timestep_task:
       output = tf.reshape(output, inputs_shape)
-
     return output
 
 
@@ -4883,3 +4937,75 @@ class CCTGatingNetwork(quant_utils.QuantizableLayer):
     flops = 5 * other_dims * p.num_outputs * p.hidden_layer_dim
     out_shape = tshape.Shape(inputs[:-1] + [symbolic.ToStatic(p.num_outputs)])
     return py_utils.NestedMap(flops=flops, out_shapes=(out_shape,))
+
+
+class CondScaleShiftFFNLayer(base_layer.BaseLayer):
+  """Feature Modulation layer.
+
+  https://distill.pub/2018/feature-wise-transformations/
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(CondScaleShiftFFNLayer, cls).Params()
+    p.Define('input_dim', 0, 'Depth of the input.')
+    p.Define('output_dim', 0, 'Depth of the output.')
+    p.Define('ffn', FeedForwardNet.Params(), 'Projection layer params')
+    p.Define('scale_fn', 'NONE',
+             'The activation function to use for scale output')
+    p.Define('shift_fn', 'NONE',
+             'The activation function to use for shift output')
+    return p
+
+  def __init__(self, params):
+    super(CondScaleShiftFFNLayer, self).__init__(params)
+    p = self.params
+    assert p.name
+
+    output_dim = p.output_dim * 2  # 1st split for shift, 2nd split for scale
+    with tf.variable_scope(p.name):
+      params_ffn = p.ffn.Copy().Set(
+          input_dim=p.input_dim, name='{}_ffn'.format(p.name))
+      params_fcout = FCLayer.Params().Copy().Set(
+          input_dim=params_ffn.hidden_layer_dims[-1],
+          output_dim=output_dim,
+          activation='NONE',
+          name='{}_fcout'.format(p.name))
+      self.CreateChild('ffn', params_ffn)
+      self.CreateChild('fcout', params_fcout)
+
+  def FProp(self, theta, inputs, paddings=None):
+    """Calculate scale shift and modify input.
+
+    Args:
+      theta: params.
+      inputs: The input tensor. Shaped [..., input_dim].
+      paddings: The input padding tensors.
+
+    Returns:
+      Output after calculating shift and scale (2 tensors).
+      Shaped [..., output_dim].
+    """
+    p = self.params
+
+    ffn_output = self.ffn.FProp(theta.ffn, inputs, paddings)
+    fcout_output = self.fcout.FProp(theta.fcout, ffn_output, paddings)
+    scale_output, shift_output = tf.split(
+        fcout_output, num_or_size_splits=2, axis=-1)
+
+    def OpWrapper(name, tensor):
+      """Wrapper for retrieve tf operations."""
+      if name in _ACTIVATIONS:
+        op = _ACTIVATIONS[name]
+      else:
+        if name == 'EXP':
+          op = tf.exp
+        elif name == 'NONE':
+          op = tf.identity
+        else:
+          raise ValueError()
+        return op(tensor)
+
+    scale_output = OpWrapper(p.scale_fn, scale_output)
+    shift_output = OpWrapper(p.shift_fn, shift_output)
+    return scale_output, shift_output

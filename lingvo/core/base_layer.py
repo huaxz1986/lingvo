@@ -102,7 +102,7 @@ class Accumulator(object):
     raise NotImplementedError('DefaultValue must be implemented')
 
 
-def initializer(func):  # pylint: disable=invalid-name
+def _BaseLayerInitWrapper(func):  # pylint: disable=invalid-name
   """A decorator for layer's __init__.
 
   Args:
@@ -172,7 +172,7 @@ class BaseLayerMeta(type):
 
       cls.__init__ = TrivialInit
 
-    cls.__init__ = initializer(cls.__init__)
+    cls.__init__ = _BaseLayerInitWrapper(cls.__init__)
     return cls
 
   # pylint: enable=bad-mcs-classmethod-argument
@@ -327,7 +327,7 @@ class BaseLayer(tf.Module):
     # have self._private_children equals to self._children_list. I.e.,
     # all child layers are created using CreateChild/CreateChildren.
     self._children_list = []
-    # Extra theta's not directly correpond to any underlying vars. For example,
+    # Extra theta's not directly correspond to any underlying vars. For example,
     # the concatenated sharded variables.
     self._extra_theta = py_utils.NestedMap()
     # All registered accumulators.

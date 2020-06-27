@@ -401,6 +401,29 @@ class GroupNormLayerTest(test_utils.TestCase):
       self.assertAllClose(expected_out, gn_out.eval(), atol=1e-5)
       self.assertAllEqual(paddings.eval(), paddings_out.eval())
 
+  def testGroupNormLayerFPropCumulativeMode(self):
+    with self.session(use_gpu=True):
+      params = bn_layers.GroupNormLayer.Params()
+      params.name = 'gn'
+      params.dim = 2
+      params.num_groups = 2
+      params.cumulative = True
+      # gn_in[0]: [[0, 1], [2, 3], [4, 5], [6, 7]]
+      # gn_in[1]: [[8, 9], [10, 11], [12, 13], [14, 15]]
+      gn_in = tf.reshape(np.arange(16, dtype=np.float32), [2, 4, 1, 2])
+      paddings = tf.convert_to_tensor([[0, 0], [0, 0], [0, 0], [0, 0]],
+                                      dtype=tf.float32)
+      gn_layer = bn_layers.GroupNormLayer(params)
+      gn_out, _ = gn_layer.FPropDefaultTheta(gn_in, paddings)
+
+      tf.global_variables_initializer().run()
+      base_block = np.array([[0., 0.], [1.4128014, 1.4128014],
+                             [1.5487288, 1.5487288], [1.6033384, 1.6033384]])
+
+      expected_out = np.stack([base_block, base_block],
+                              axis=0).reshape([2, 4, 1, 2])
+      self.assertAllClose(expected_out, gn_out.eval(), atol=1e-5)
+
 
 class ConvLayerTest(test_utils.TestCase):
   """Tests conv layers.
@@ -1743,7 +1766,7 @@ class ProjectionLayerTest(test_utils.TestCase, parameterized.TestCase):
                            layer_callback=None,
                            bn_decay=0.999,
                            bn_use_moving_avg_in_training=False,
-                           use_einsum=False):
+                           use_einsum=True):
     self._ClearCachedSession()
     tf.reset_default_graph()
     with self.session(use_gpu=True):
@@ -4779,17 +4802,19 @@ class GluLayerTest(test_utils.TestCase):
       self.assertAllClose(actual_layer_output, expected_output)
 
 
-class MultitaskAdapterLayerTest(test_utils.TestCase):
+class MultitaskAdapterLayerTest(test_utils.TestCase, parameterized.TestCase):
 
-  def _MultitaskAdapterParams(self):
+  def _MultitaskAdapterParams(self, data_format='TBC'):
     return layers.MultitaskAdapterLayer.Params().Set(
         name='multi_adapter',
         input_dim=4,
         bottleneck_dim=2,
         num_tasks=3,
+        data_format=data_format,
         random_seed=505837249)
 
-  def testSingleStepFProp(self):
+  @parameterized.parameters('TBC', 'BTC')
+  def testSingleStepFProp(self, data_format):
     with self.session(use_gpu=True):
       np.random.seed(1234567)
       # Inputs are of shape [1, batch, input_dim] (single time step)
@@ -4799,22 +4824,28 @@ class MultitaskAdapterLayerTest(test_utils.TestCase):
                              [0.5, 0.3, -0.2, 0.0], [0.5, 0.3, -0.2, 0.0]]],
                            dtype=tf.float32)
       tasks = tf.constant([1, 0, 1, 0], dtype=tf.int32)
-      p = self._MultitaskAdapterParams()
+      if data_format == 'BTC':
+        inputs = tf.transpose(inputs, [1, 0, 2])
+      p = self._MultitaskAdapterParams(data_format)
       adapter = p.Instantiate()
       output = adapter.FProp(adapter.theta, inputs, tasks)
       self.evaluate(tf.global_variables_initializer())
       actual = self.evaluate(output)
-      expected = [[[-0.674434, -0.331616, 0.066886, 0.388049],
-                   [0.262231, 0.667873, -0.92701, 2.246897],
-                   [-0.674434, -0.331616, 0.066886, 0.388049],
-                   [0.737031, 0.330693, -0.227962, 0.138892]]]
+      if data_format == 'BTC':
+        actual = tf.transpose(actual, [1, 0, 2])
+      tf.logging.info('testSingleStepFProp actual=%r' % actual)
+      expected = [[[1.1579462, 1.2241995, -0.6177901, 0.23089096],
+                   [0.05022227, 0.9056754, -0.3771479, 2.1245508],
+                   [1.1579462, 1.2241995, -0.6177901, 0.23089096],
+                   [0.55389655, 0.5207228, 0.46842042, 0.13366304]]]
       self.assertEqual(actual.shape, (1, 4, 4))
       # Batch elements 0 and 2 are equal because they had the same input
       # and the same task ID.
       self.assertAllClose(actual[0][0], actual[0][2], rtol=1e-05, atol=1e-05)
       self.assertAllClose(expected, actual, rtol=1e-05, atol=1e-05)
 
-  def testMultiStepFProp(self):
+  @parameterized.parameters('TBC', 'BTC')
+  def testMultiStepFProp(self, data_format):
     with self.session(use_gpu=True):
       np.random.seed(1234567)
       # Inputs are same as above but of shape [time, batch, input_dim]
@@ -4823,20 +4854,26 @@ class MultitaskAdapterLayerTest(test_utils.TestCase):
                            dtype=tf.float32)
       # tasks is of shape [batch] indicating one task for each sequence.
       tasks = tf.constant([1, 0], dtype=tf.int32)
-      p = self._MultitaskAdapterParams()
+      if data_format == 'BTC':
+        inputs = tf.transpose(inputs, [1, 0, 2])
+      p = self._MultitaskAdapterParams(data_format)
       adapter = p.Instantiate()
       output = adapter.FProp(adapter.theta, inputs, tasks)
       self.evaluate(tf.global_variables_initializer())
       actual = self.evaluate(output)
+      if data_format == 'BTC':
+        actual = tf.transpose(actual, [1, 0, 2])
+      tf.logging.info('testMultiStepFProp actual=%r' % actual)
       # Output is same as above but with shape same as input.
-      expected = [[[-0.674434, -0.331616, 0.066886, 0.388049],
-                   [0.262231, 0.667873, -0.92701, 2.246897]],
-                  [[-0.674434, -0.331616, 0.066886, 0.388049],
-                   [0.737031, 0.330693, -0.227962, 0.138892]]]
+      expected = [[[1.1579462, 1.2241995, -0.6177901, 0.23089096],
+                   [0.05022227, 0.9056754, -0.3771479, 2.1245508]],
+                  [[1.1579462, 1.2241995, -0.6177901, 0.23089096],
+                   [0.55389655, 0.5207228, 0.46842045, 0.13366304]]]
       self.assertEqual(actual.shape, (2, 2, 4))
       self.assertAllClose(expected, actual, rtol=1e-05, atol=1e-05)
 
-  def testSpecifyTaskPerTimestepFProp(self):
+  @parameterized.parameters('TBC', 'BTC')
+  def testSpecifyTaskPerTimestepFProp(self, data_format):
     with self.session(use_gpu=True):
       np.random.seed(1234567)
       inputs = tf.constant([[[0.5, 0.3, -0.2, 0.0], [0.0, 0.7, -1.0, 2.0]],
@@ -4847,20 +4884,27 @@ class MultitaskAdapterLayerTest(test_utils.TestCase):
       # still have the task ID consistent across timesteps in order to
       # replicate the previous test's output.
       tasks = tf.constant([[1, 0], [1, 0]], dtype=tf.int32)
-      p = self._MultitaskAdapterParams()
+      if data_format == 'BTC':
+        inputs = tf.transpose(inputs, [1, 0, 2])
+        tasks = tf.transpose(tasks, [1, 0])
+      p = self._MultitaskAdapterParams(data_format)
       adapter = p.Instantiate()
       output = adapter.FProp(adapter.theta, inputs, tasks)
       self.evaluate(tf.global_variables_initializer())
       actual = self.evaluate(output)
+      if data_format == 'BTC':
+        actual = tf.transpose(actual, [1, 0, 2])
+      tf.logging.info('testSpecifyTaskPerTimestepFProp actual=%r' % actual)
       # Output is same as above.
-      expected = [[[-0.674434, -0.331616, 0.066886, 0.388049],
-                   [0.262231, 0.667873, -0.92701, 2.246897]],
-                  [[-0.674434, -0.331616, 0.066886, 0.388049],
-                   [0.737031, 0.330693, -0.227962, 0.138892]]]
+      expected = [[[1.1579462, 1.2241995, -0.6177901, 0.23089096],
+                   [0.05022227, 0.9056754, -0.3771479, 2.1245508]],
+                  [[1.1579462, 1.2241995, -0.6177901, 0.23089096],
+                   [0.55389655, 0.5207228, 0.46842042, 0.13366304]]]
       self.assertEqual(actual.shape, (2, 2, 4))
       self.assertAllClose(expected, actual, rtol=1e-05, atol=1e-05)
 
-  def testDifferentTaskPerTimestepFProp(self):
+  @parameterized.parameters('TBC', 'BTC')
+  def testDifferentTaskPerTimestepFProp(self, data_format):
     with self.session(use_gpu=True):
       np.random.seed(1234567)
       inputs = tf.constant([[[0.5, 0.3, -0.2, 0.0], [0.0, 0.7, -1.0, 2.0]],
@@ -4869,15 +4913,21 @@ class MultitaskAdapterLayerTest(test_utils.TestCase):
       # tasks are again of shape [time, batch] but with different tasks
       # for each timestep.
       tasks = tf.constant([[1, 0], [2, 1]], dtype=tf.int32)
-      p = self._MultitaskAdapterParams()
+      if data_format == 'BTC':
+        inputs = tf.transpose(inputs, [1, 0, 2])
+        tasks = tf.transpose(tasks, [1, 0])
+      p = self._MultitaskAdapterParams(data_format)
       adapter = p.Instantiate()
       output = adapter.FProp(adapter.theta, inputs, tasks)
       self.evaluate(tf.global_variables_initializer())
       actual = self.evaluate(output)
-      expected = [[[-0.674434, -0.331616, 0.066886, 0.388049],
-                   [0.262231, 0.667873, -0.92701, 2.246897]],
-                  [[0.181782, 0.928383, -0.307064, 0.560411],
-                   [-0.674434, -0.331616, 0.066886, 0.388049]]]
+      if data_format == 'BTC':
+        actual = tf.transpose(actual, [1, 0, 2])
+      tf.logging.info('testDifferentTaskPerTimestepFProp actual=%r' % actual)
+      expected = [[[1.1579462, 1.2241995, -0.6177901, 0.23089096],
+                   [0.05022227, 0.9056754, -0.3771479, 2.1245508]],
+                  [[0.6961179, 0.06690431, -0.08757646, 0.40129724],
+                   [1.1579462, 1.2241995, -0.6177901, 0.23089096]]]
       self.assertEqual(actual.shape, (2, 2, 4))
       self.assertAllClose(expected, actual, rtol=1e-05, atol=1e-05)
 
@@ -4906,7 +4956,10 @@ class MultitaskAdapterLayerTest(test_utils.TestCase):
       dense_grads = [DenseGrad(x, y) for (x, y) in zip(all_vars, grads)]
       dense_grad_sums = [tf.reduce_sum(g) for g in dense_grads]
       grad_vs = self.evaluate(dense_grad_sums)
-      self.assertAllClose([0., -0.239046, 12.765231, 16.0, 0.342786, -1.191779],
+      self.assertAllClose([
+          -5.364418e-07, 3.405262e+00, 1.252710e+01, 1.600000e+01, 1.335246e+00,
+          2.513876e-01
+      ],
                           grad_vs,
                           rtol=1e-05,
                           atol=1e-05)
@@ -4974,6 +5027,42 @@ class CCTGatingNetworkTest(test_utils.TestCase):
       self.evaluate(tf.global_variables_initializer())
       out_v = self.evaluate([out])
       self.assertAllClose(out_v, [[[0., 1., 1.], [0., 0., 1.], [0., 1., 1.]]])
+
+
+class CondScaleShiftFFNLayerTest(test_utils.TestCase):
+
+  def testCondScaleShiftFFNLayerConstruction(self):
+    with self.session(use_gpu=False):
+      params = layers.CondScaleShiftFFNLayer.Params().Set(
+          name='ss_ffn',
+          input_dim=10,
+          output_dim=7,
+          scale_fn='NONE',
+          shift_fn='NONE')
+      params.ffn.hidden_layer_dims = [5, 5]
+      layer_ss = params.Instantiate()
+      time_c, batch_c, in_dim_c = 15, 2, 10
+      a = tf.constant(1.0, shape=[time_c, batch_c, in_dim_c])
+      layer_ss.FPropDefaultTheta(a)
+
+  def testCondScaleShiftFFNLayerFprop(self):
+    with self.session(use_gpu=False):
+      time_c, batch_c, in_dim_c, out_dim_c = 15, 2, 10, 7
+      params = layers.CondScaleShiftFFNLayer.Params().Set(
+          name='ss_ffn',
+          input_dim=in_dim_c,
+          output_dim=out_dim_c,
+          scale_fn='NONE',
+          shift_fn='NONE')
+      params.ffn.hidden_layer_dims = [5, 5]
+      layer_ss = params.Instantiate()
+
+      a = tf.constant(1.0, shape=[time_c, batch_c, in_dim_c])
+      scale_out, shift_out = layer_ss.FPropDefaultTheta(a)
+      self.evaluate(tf.global_variables_initializer())
+      scale_out, shift_out = self.evaluate([scale_out, shift_out])
+      self.assertEqual(scale_out.shape, (time_c, batch_c, out_dim_c))
+      self.assertEqual(shift_out.shape, (time_c, batch_c, out_dim_c))
 
 
 if __name__ == '__main__':

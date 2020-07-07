@@ -1,4 +1,4 @@
-# Lint as: python2, python3
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,14 +31,11 @@ There are three types of batch sizes:
 TODO(rpang): Deal with on packed_inputs.
 """
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import inspect
 
 import lingvo.compat as tf
 from lingvo.core import base_layer
+from lingvo.core import batch_utils
 from lingvo.core import datasource
 from lingvo.core import hyperparams
 from lingvo.core import input_generator_helper as ig_helper
@@ -46,10 +43,6 @@ from lingvo.core import inspect_utils
 from lingvo.core import ops
 from lingvo.core import py_utils
 from lingvo.core import tokenizers
-import six
-from six.moves import map
-from six.moves import range
-from six.moves import zip
 import tensorflow.compat.v1 as tf1
 import tensorflow.compat.v2 as tf2
 
@@ -68,7 +61,7 @@ class BaseInputGenerator(base_layer.BaseLayer):
   @classmethod
   def Params(cls):
     """Defaults params for input generators."""
-    p = super(BaseInputGenerator, cls).Params()
+    p = super().Params()
     p.name = 'input'
     p.Define(
         'batch_size', 0, 'Batch size for a device split. This will be '
@@ -102,7 +95,7 @@ class BaseInputGenerator(base_layer.BaseLayer):
     return p
 
   def __init__(self, params):
-    super(BaseInputGenerator, self).__init__(params)
+    super().__init__(params)
     # parameter to tell the bprop one hot for all the files.
     # TODO(ankurbpn): Initialize when using sources from mixed record yielders.
     self._bprop_onehot = tf.constant([1], dtype=tf.float32)
@@ -131,31 +124,17 @@ class BaseInputGenerator(base_layer.BaseLayer):
 
   def GlobalBatchSize(self):
     """Returns the total batch size (for stats), int or dynamic int tensor."""
-    p = self.params
-    global_batch_size = self.InfeedBatchSize()
-    cluster = self.cluster
-    if p.use_per_host_infeed and cluster.num_tpu_hosts > 0:
-      if not py_utils.use_tpu():
-        raise ValueError('Scaling to TPU hosts without TPUs. {}'.format(
-            cluster.num_tpu_hosts))
-      global_batch_size *= cluster.num_tpu_hosts
+    # Uses `InfeedBatchSize()` instead of calculating it from `p.batch_size`
+    # because the behavior would be overridden by subclasses.
+    global_batch_size = batch_utils.scale_infeed_to_global(
+        self.InfeedBatchSize(), self.params.use_per_host_infeed)
     tf.logging.info('GlobalBatchSize {}'.format(global_batch_size))
     return global_batch_size
 
-  def _ScaleBatchSizeToBatchPerInput(self, batch_size):
-    """Scales a batch_size parameter to the batch size of the infeed."""
-    cluster = self.cluster
-    batch_per_input = batch_size * cluster.num_splits_per_client
-    # If use_per_host_infeed, each input op is only responsible
-    # for generating a subset of the whole batch.
-    if self.params.use_per_host_infeed and cluster.num_tpu_hosts > 0:
-      batch_per_input //= cluster.num_tpu_hosts
-    return batch_per_input
-
   def InfeedBatchSize(self):
     """Returns the batch size of the input batch: int or dynamic int tensor."""
-    batch_per_input = self._ScaleBatchSizeToBatchPerInput(
-        self.params.batch_size)
+    batch_per_input = batch_utils.scale_split_to_infeed(
+        self.params.batch_size, self.params.use_per_host_infeed)
     tf.logging.info('batch_per_input: %d', batch_per_input)
     return batch_per_input
 
@@ -445,7 +424,7 @@ class BaseInputGeneratorFromFiles(BaseInputGenerator):
   @classmethod
   def Params(cls):
     """Defaults params for input generators."""
-    p = super(BaseInputGeneratorFromFiles, cls).Params()
+    p = super().Params()
     p.Define(
         # NOTE: file_pattern is deprecated.  New params should use
         # file_datasource instead.
@@ -523,7 +502,7 @@ class BaseInputGeneratorFromFiles(BaseInputGenerator):
     return p
 
   def __init__(self, params):
-    super(BaseInputGeneratorFromFiles, self).__init__(params)
+    super().__init__(params)
     p = self.params
     if p.use_per_host_infeed and p.file_random_seed != 0:
       raise ValueError('file_random_seed needs to be 0 when '
@@ -534,11 +513,11 @@ class BaseInputGeneratorFromFiles(BaseInputGenerator):
 
     # TODO(b/139345706) remove support for file_pattern
     if not p.file_datasource:
-      if isinstance(p.file_pattern, six.string_types):
+      if isinstance(p.file_pattern, str):
         p.file_datasource = datasource.SimpleDataSource.Params().Set(
             file_pattern=p.file_pattern)
       elif isinstance(p.file_pattern, (list, tuple)):
-        if all([isinstance(x, six.string_types) for x in p.file_pattern]):
+        if all([isinstance(x, str) for x in p.file_pattern]):
           # While this violates the documentation and intended use, there are
           # subclasses that have used a tuple of strings, rather than a list of
           # string, weight tuples.  Rather than treating lists and tuples
@@ -553,7 +532,7 @@ class BaseInputGeneratorFromFiles(BaseInputGenerator):
             # file_pattern param contains a list of
             # <file_pattern, weight, [bprop_variable_filter]> tuples.
             raise ValueError('Expected a list of pairs, got %s' %
-                             (p.file_pattern,))
+                             p.file_pattern)
 
           file_patterns, weights = (list(x) for x in zip(*p.file_pattern))
 
@@ -569,10 +548,10 @@ class BaseInputGeneratorFromFiles(BaseInputGenerator):
           weights = []
           bprop_variable_filters = []
           for input_entry in p.file_pattern:
-            if isinstance(input_entry, six.string_types):
+            if isinstance(input_entry, str):
               raise ValueError(
                   'Should explicitly specify weights, got string: %s' %
-                  (input_entry,))
+                  input_entry)
             file_pattern, weight = input_entry[:2]
             file_patterns.append(file_pattern)
             weights.append(weight)
@@ -592,7 +571,7 @@ class BaseInputGeneratorFromFiles(BaseInputGenerator):
   def CommonInputOpArgs(self):
     """Common input params."""
     p = self.params
-    args = super(BaseInputGeneratorFromFiles, self).CommonInputOpArgs()
+    args = super().CommonInputOpArgs()
     if p.file_datasource and issubclass(p.file_datasource.cls,
                                         datasource.ChainingDataSource):
       # If a user provides a ChainingDataSource make sure that the
@@ -705,7 +684,7 @@ class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
   @classmethod
   def Params(cls):
     """Defaults params for sequence input generators."""
-    p = super(BaseSequenceInputGenerator, cls).Params()
+    p = super().Params()
     p.Delete('batch_size')
     p.remote.shardable_batch = False
 
@@ -734,7 +713,7 @@ class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
     return p
 
   def __init__(self, params):
-    super(BaseSequenceInputGenerator, self).__init__(params)
+    super().__init__(params)
 
     p = self.params
 
@@ -743,7 +722,7 @@ class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
       p.tokenizer_dict[DEFAULT_TOKENIZER_KEY] = p.tokenizer
 
     self.tokenizer_dict = {}
-    for k, p in six.iteritems(p.tokenizer_dict):
+    for k, p in p.tokenizer_dict.items():
       if p:
         name = '_tokenizer_' + k
         self.CreateChild(name, p)
@@ -760,7 +739,8 @@ class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
     p = self.params
     cluster = self.cluster
     infeed_bucket_batch_limit = [
-        self._ScaleBatchSizeToBatchPerInput(b) for b in p.bucket_batch_limit
+        batch_utils.scale_split_to_infeed(b, p.use_per_host_infeed)
+        for b in p.bucket_batch_limit
     ]
     tf.logging.info(
         'infeed_bucket_batch_limit={} num_splits_per_client={} bucket_batch_limit={}'
@@ -877,7 +857,7 @@ class BaseTinyDatasetInput(BaseInputGenerator):
   @classmethod
   def Params(cls):
     """Defaults params."""
-    p = super(BaseTinyDatasetInput, cls).Params()
+    p = super().Params()
     p.Define('ckpt', None, 'A TensorFlow checkpoint.')
     p.Define('data', 'x_train', 'The tensor name in the ckpt.')
     p.Define('data_dtype', tf.uint8, 'The tensor dtype in the ckpt.')
@@ -932,7 +912,7 @@ class BaseDataExampleInputGenerator(BaseInputGenerator):
 
   @classmethod
   def Params(cls):
-    p = super(BaseDataExampleInputGenerator, cls).Params()
+    p = super().Params()
     p.Define('input_files', None, 'Delimited glob of input files.')
     p.Define(
         'dataset_type', None,
@@ -952,7 +932,7 @@ class BaseDataExampleInputGenerator(BaseInputGenerator):
     return p
 
   def __init__(self, params):
-    super(BaseDataExampleInputGenerator, self).__init__(params)
+    super().__init__(params)
     p = params
     assert p.input_files, (
         'input_files is required for a tf.data example input generator')

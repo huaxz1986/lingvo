@@ -15,7 +15,6 @@
 # ==============================================================================
 """Tests for lr_schedule."""
 
-
 import math
 import os
 import lingvo.compat as tf
@@ -23,7 +22,6 @@ from lingvo.core import cluster_factory
 from lingvo.core import early_stop
 from lingvo.core import schedule
 from lingvo.core import test_utils
-from six.moves import range
 
 
 class LearningRateScheduleTest(test_utils.TestCase):
@@ -511,7 +509,8 @@ class LearningRateScheduleTest(test_utils.TestCase):
         warmup_steps=200,
         initial_value=3.0,
         final_value=1.0,
-        total_steps=400000)
+        total_steps=400000,
+        num_splits=1)
     with self.session():
       lrs = p.Instantiate()
 

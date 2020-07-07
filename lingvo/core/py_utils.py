@@ -1,5 +1,4 @@
-# Lint as: python2, python3
-# -*- coding: utf-8 -*-
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,10 +14,6 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import collections as py_collections
 import contextlib
@@ -41,8 +36,6 @@ from lingvo.core import symbolic
 from lingvo.core import tshape
 import numpy as np
 import six
-from six.moves import range
-from six.moves import zip
 
 from model_pruning.python import pruning
 # pylint: disable=g-direct-tensorflow-import
@@ -149,7 +142,7 @@ deprecation._PRINT_DEPRECATION_WARNINGS = False
 class ThreadLocalStack(threading.local):
 
   def __init__(self):
-    super(ThreadLocalStack, self).__init__()
+    super().__init__()
     self.stack = []
 
 
@@ -725,14 +718,14 @@ class NestedMap(dict):
   # Disable pytype attribute checking.
   _HAS_DYNAMIC_ATTRIBUTES = True
   # keys in this list are not allowed in a NestedMap.
-  _RESERVED_KEYS = set(dir(dict))
+  _RESERVED_KEYS = frozenset(dir(dict))
   # sentinel value for deleting keys used in Filter.
   _DELETE = object()
 
   def __init__(self, *args, **kwargs):
-    super(NestedMap, self).__init__(*args, **kwargs)
+    super().__init__(*args, **kwargs)
     for key in self.keys():
-      assert isinstance(key, six.string_types), (
+      assert isinstance(key, str), (
           'Key in a NestedMap has to be a six.string_types. Currently type: %s,'
           ' value: %s' % (str(type(key)), str(key)))
       NestedMap.CheckKey(key)
@@ -741,12 +734,12 @@ class NestedMap(dict):
   def __setitem__(self, key, value):
     # Make sure key is a valid expression and is not one of the reserved
     # attributes.
-    assert isinstance(key, six.string_types), (
+    assert isinstance(key, str), (
         'Key in a NestedMap has to be a six.string_types. Currently type: %s, '
         'value: %s' % (str(type(key)), str(key)))
     NestedMap.CheckKey(key)
     assert key not in NestedMap._RESERVED_KEYS, ('%s is a reserved key' % key)
-    super(NestedMap, self).__setitem__(key, value)
+    super().__setitem__(key, value)
 
   def __setattr__(self, name, value):
     self.__setitem__(name, value)
@@ -781,7 +774,7 @@ class NestedMap(dict):
     """Converts every dict in nested structure 'x' to a NestedMap."""
     if isinstance(x, dict):
       res = NestedMap()
-      for k, v in six.iteritems(x):
+      for k, v in x.items():
         res[k] = NestedMap.FromNestedDict(v)
       return res
     elif isinstance(x, (list, tuple)):
@@ -792,7 +785,7 @@ class NestedMap(dict):
   @staticmethod
   def CheckKey(key):
     """Asserts that key is valid NestedMap key."""
-    if not (isinstance(key, six.string_types) and _NAME_PATTERN.match(key)):
+    if not (isinstance(key, str) and _NAME_PATTERN.match(key)):
       raise ValueError('Invalid NestedMap key \'{}\''.format(key))
 
   def GetItem(self, key):
@@ -1004,7 +997,7 @@ class NestedMap(dict):
       tf.logging.vlog(level, '%s %s', prefix, l)
 
 
-class _Unique(object):
+class _Unique:
   """A helper to uniqify variables in a NestedMap."""
 
   def __init__(self):
@@ -1035,7 +1028,7 @@ def ReadOnlyAttrDictView(backing):
     Read-only Mapping that can be accessed by index (['foo']) or attr (d.foo).
   """
 
-  class Wrapper(object):
+  class Wrapper:
     """Wrapper object."""
 
     # Disable pytype attribute checking.
@@ -1086,7 +1079,7 @@ def Zeros(shape, *args, **kwargs):
   return tf.zeros(ToStaticShape(shape), *args, **kwargs)
 
 
-class UniformSampler(object):
+class UniformSampler:
   """A reservoir sampler.
 
   This class implements reservoir sampling: Given a limit of `num_samples` total
@@ -1120,7 +1113,7 @@ class UniformSampler(object):
     return self._samples
 
 
-class RNNCellStateInit(object):
+class RNNCellStateInit:
   """State initialization functions for RNN cell init state."""
 
   @staticmethod
@@ -1181,7 +1174,7 @@ def InitRNNCellState(shape, init=None, dtype=None, name=None, is_eval=False):
   return init_state
 
 
-class WeightInit(object):
+class WeightInit:
   """Static class providing weight initialization config params."""
 
   @staticmethod
@@ -1343,7 +1336,7 @@ def FindNeededInList(tensor_list, endpoints):
   return [t for t in tensor_list if t.name in all_needed]
 
 
-class _CollectionGetter(object):
+class _CollectionGetter:
   """Get graph local value from a defined collection."""
 
   def __init__(self, key, default_factory):
@@ -1573,14 +1566,12 @@ def CreateVariable(name,
     a var, var pair.
   """
   p = params.Copy()
-  assert isinstance(p, hyperparams.Params)
-  dtype = p.dtype
   shape = tf.TensorShape(ToStaticShape(p.shape)).as_list()
-  p.Set(shape=shape)
-  dim0 = 1
   if shape:
     assert all([dim_size > 0 for dim_size in shape]), shape
     dim0 = shape[0]
+  else:
+    dim0 = 1
   assert p.init.method == 'constant' or np.all(np.asarray(p.init.scale) >= 0)
   method = p.init.method
   scale = p.init.scale
@@ -1591,6 +1582,9 @@ def CreateVariable(name,
         'WARNING!!! var %s is using the default xavier initializer.'
         ' Make sure this is intended.', name)
 
+  with tf.variable_scope(name) as scope:
+    var_name = GetVariableName(scope.name)
+
   if tf.get_default_graph().seed is not None:
     # We are in a program/test which need determistic randomization.
     if seed is None:
@@ -1599,8 +1593,6 @@ def CreateVariable(name,
       else:
         # We are not given a per-variable random seed. We use hash of
         # variable name as a stable random seed.
-        with tf.variable_scope(name) as scope:
-          var_name = GetVariableName(scope.name)
         seed = GenerateSeedFromName(var_name)
 
   if (method in [
@@ -1623,7 +1615,7 @@ def CreateVariable(name,
     if fan_out is not None:
       scale *= 1.0 / math.sqrt(fan_out)
 
-  init_dtype = dtype.real_dtype
+  init_dtype = p.dtype.real_dtype
   if method in [
       'gaussian', 'gaussian_sqrt_dim', 'gaussian_sqrt_fanin',
       'gaussian_sqrt_fanout'
@@ -1679,7 +1671,7 @@ def CreateVariable(name,
   else:
     assert False, 'init_type not supported.'
 
-  if dtype == tf.complex64:
+  if p.dtype == tf.complex64:
 
     def ComplexWrapper(init):
 
@@ -1694,59 +1686,64 @@ def CreateVariable(name,
 
     v_init = ComplexWrapper(v_init)
 
+  # Variable creators.
   def MaybePinVarsToCpu(next_creator, **kwargs):
     if _FromGlobal('pin_vars_to_cpu'):
       with tf.device('/cpu:0'):
         return next_creator(**kwargs)
     return next_creator(**kwargs)
 
-  # TODO(yonghui): Possibly get away from variable_scope and implement our own
-  # variable sharing mechanism.
-  def GetVar(reuse=reuse):
-    """reuse: Whether to reuse the variables."""
-    var_shape = GetVariableShapePrefixes() + list(shape)
+  def MaybeOpportunisticVariableReuse(next_creator, **kwargs):
+    try:
+      return next_creator(**kwargs)
+    except ValueError:  # Possibly the variable already exists
+      if GetOpportunisticVariableReuse():
+        with tf.variable_scope(tf.get_variable_scope(), reuse=True):
+          return next_creator(**kwargs)
+      else:
+        raise
+
+  def LingvoVariableCreator(next_creator, **kwargs):
+    """Lingvo variable creator."""
+    # TODO(yonghui): Possibly get away from variable_scope and implement our own
+    # variable sharing mechanism.
     with tf.variable_scope(name) as scope:
-      var_name = GetVariableName(scope.name)
       var_scope = tf.VariableScope(
           scope.reuse,
           custom_getter=scope.custom_getter,
           caching_device=scope.caching_device,
           use_resource=scope.use_resource or use_resource_variables())
-    with tf.variable_scope(var_scope), \
-        tf.variable_scope(var_name, reuse=reuse) as scope:
+    with tf.variable_scope(var_scope), tf.variable_scope(var_name, reuse=reuse):
+      var = next_creator(**kwargs)
+
+    var_ref = var.experimental_ref()  # For key in dict/set.
+    all_vars = _get_all_vars()
+    if var_ref in all_vars:
+      tf.logging.info('Reusing var %s', var.name)
+      cached = all_vars[var_ref]
+      assert cached == p.ToText(), ('Cached config:\n %s vs new config:\n %s' %
+                                    (cached, p.ToText()))
+    else:
+      tf.logging.info('Creating var %s shape=%s on device %s', var.name,
+                      var.shape, var.device)
+      all_vars[var_ref] = p.ToText()
+      for col in p.collections:
+        tf.add_to_collection(col, var)
+    return var
+
+  with VariableCreatorScope(LingvoVariableCreator):
+    with VariableCreatorScope(MaybeOpportunisticVariableReuse):
       with VariableCreatorScope(MaybePinVarsToCpu):
-        return _GetVariableCreator()(
+        var = _GetVariableCreator()(
             name='var',
-            shape=var_shape,
-            dtype=dtype,
+            shape=GetVariableShapePrefixes() + list(shape),
+            dtype=p.dtype,
             initializer=v_init,
             collections=collections,
             trainable=trainable,
-            validate_shape=True if var_shape is not None else False,
+            validate_shape=True,
             synchronization=synchronization,
             aggregation=aggregation)
-
-  if GetOpportunisticVariableReuse():
-    try:
-      var = GetVar()
-    except ValueError:  # Possibly the variable already exists
-      var = GetVar(reuse=True)
-  else:
-    var = GetVar()
-
-  var_ref = var.experimental_ref()  # For key in dict/set.
-  all_vars = _get_all_vars()
-  if var_ref in all_vars:
-    tf.logging.info('Reusing var %s', var.name)
-    cached = all_vars[var_ref]
-    assert cached == p, ('Cached config:\n %s vs new config:\n %s' %
-                         (cached.ToText(), p.ToText()))
-  else:
-    tf.logging.info('Creating var %s shape=%s on device %s', var.name,
-                    var.shape, var.device)
-    all_vars[var_ref] = p.Copy()
-    for col in p.collections:
-      tf.add_to_collection(col, var)
 
   if _FromGlobal('no_identity_on_vars'):
     with tf.device(var.device):
@@ -1854,7 +1851,8 @@ def CreateLocalTheta(theta, device_list=None, label=None):
     A `.NestedMap` of identity() wrapped theta
   """
 
-  class AddIdentity(object):
+  class AddIdentity:
+    """Helper class."""
 
     def __init__(self, device_list):
       self._list = device_list if device_list else ['']
@@ -2092,7 +2090,7 @@ def _ComputeGradientsTpu(loss,
   return aggregated_grads
 
 
-class VarGrad(object):
+class VarGrad:
   """A class that holds a variable and a gradient."""
 
   _VAR_GRAD = py_collections.namedtuple('VarGradNamedTuple', ['var', 'grad'])
@@ -2473,7 +2471,7 @@ def SplitRecursively(x, num_splits, axis=-1):
     return [list(t) for t in splits]
   elif isinstance(x, NestedMap):
     results = [NestedMap() for _ in range(num_splits)]
-    for key, val in six.iteritems(x):
+    for key, val in x.items():
       val_splits = SplitRecursively(val, num_splits, axis)
       for i in range(num_splits):
         results[i][key] = val_splits[i]
@@ -2602,12 +2600,12 @@ def WeightedAvgOfMetrics(metrics):
   ret_dict = {}
   lists_of_metrics = {}
   for m in metrics:
-    for name, (value, weight) in six.iteritems(m):
+    for name, (value, weight) in m.items():
       if name not in lists_of_metrics:
         lists_of_metrics[name] = []
       lists_of_metrics[name].append((value, weight))
 
-  for name, values_and_weights in sorted(six.iteritems(lists_of_metrics)):
+  for name, values_and_weights in sorted(lists_of_metrics.items()):
     values = tf.stack([x[0] for x in values_and_weights])
     weights = tf.stack([x[1] for x in values_and_weights])
     ret_dict[name] = WeightedAvg(values, weights, tf.reduce_sum, name)
@@ -2627,12 +2625,12 @@ def ConcatPerExampleTensors(per_example):
   ret_dict = {}
   lists_of_per_example = {}
   for m in per_example:
-    for name, value in six.iteritems(m):
+    for name, value in m.items():
       if name not in lists_of_per_example:
         lists_of_per_example[name] = []
       lists_of_per_example[name].append(value)
 
-  for name, values in sorted(six.iteritems(lists_of_per_example)):
+  for name, values in sorted(lists_of_per_example.items()):
     ret_dict[name] = tf.concat(values, 0)
 
   return ret_dict
@@ -2657,10 +2655,8 @@ def CombineMetrics(loss_metric_weight_pairs):
     ValueError: if there exists a metric that exists in more than one element
       of `loss_metric_weight_pairs` but not in all of them.
   """
-  all_keys = set([
-      k for loss_metrics, _ in loss_metric_weight_pairs
-      for k in six.iterkeys(loss_metrics)
-  ])
+  all_keys = set(
+      [k for loss_metrics, _ in loss_metric_weight_pairs for k in loss_metrics])  # pylint: disable=g-complex-comprehension
   result = {}
   for k in all_keys:
     count = 0
@@ -3721,7 +3717,7 @@ def RematerializeFn(fn, *xs):
 
 # A set of names of stateful random number generator ops.
 # See tensorflow/core/ops/random_ops.cc
-_STATEFUL_RANDOM_OPS = {
+_STATEFUL_RANDOM_OPS = frozenset({
     # pyformat: disable
     'RandomUniform',
     'RandomUniformInt',
@@ -3734,7 +3730,7 @@ _STATEFUL_RANDOM_OPS = {
     'RandomPoisson',
     'RandomPoissonV2',
     # pyformat: enable
-}
+})
 
 
 def StatefulRandomOpsInDefun(func, graph=None):

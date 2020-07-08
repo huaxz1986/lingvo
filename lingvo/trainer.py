@@ -495,7 +495,8 @@ class Trainer(base_runner.BaseRunner):
         if global_step >= next_status_step:
           self._SetStatusMessage(msg)
           self._ExportMetrics(
-              global_step=global_step,
+              # Metrics expects python int, but global_step is numpy.int64.
+              global_step=int(global_step),
               step_rate=step_rate,
               example_rate=example_rate)
           next_status_step = global_step + status_interval_steps
@@ -820,6 +821,7 @@ class TrainerTpu(base_runner.BaseRunner):
 
       sess.run(self._load_ops)
       while True:
+        train_steps_start = time.perf_counter()
         if FLAGS.checkpoint_in_trainer_tpu:
           # Init/restore variable if needed.
           self.checkpointer.RestoreIfNeeded(sess)
@@ -843,7 +845,9 @@ class TrainerTpu(base_runner.BaseRunner):
               target=self._InfeedLoop, args=(sess,))
           infeed_loop_thread.start()
 
+        tpu_train_op_start = time.perf_counter()
         values, outfeeds = sess.run(self._tpu_train_ops)
+        tpu_train_op_secs = time.perf_counter() - tpu_train_op_start
 
         if self._retrieve_ops:
           infeed_loop_thread.join()
@@ -882,46 +886,22 @@ class TrainerTpu(base_runner.BaseRunner):
 
         self._SetStatusMessage(msg)
 
+        checkpoint_write_secs = 0.0
         if FLAGS.checkpoint_in_trainer_tpu:
-          self.checkpointer.MaybeSave(sess, self._model.global_step)
-
-
-def _GetSpecificCheckpoint(load_checkpoint_from):
-  """Returns a specific checkpoint given `load_checkpoint_from`.
-
-  When load_checkpoint_from is a directory, we find the latest
-  checkpoint in the directory and use that as the checkpoint
-  to evaluate.
-
-  When load_checkpoint_from is a specific checkpoint, we
-  validate the path and return it.
-
-  Args:
-    load_checkpoint_from: If not None, specifies the directory or specific
-      checkpoint to load.  If a directory, the latest checkpoint in the
-      directory will be used.
-  """
-  if not load_checkpoint_from:
-    # No location specified, use existing train_dir.
-    return None
-
-  # If load_checkpoint_from is a directory, return the latest
-  # checkpoint in the directory.
-  if tf.io.gfile.isdir(load_checkpoint_from):
-    return tf.train.latest_checkpoint(load_checkpoint_from)
-
-  # We assume that load_checkpoint_from is a specific checkpoint to
-  # evaluate since it is not a directory.
-  #
-  # Check validity of eval path by looking for the index file.
-  if tf.io.gfile.exists(load_checkpoint_from + '.index'):
-    return load_checkpoint_from
-
-  # Fail if we see an unexpected load_checkpoint_from.
-  #
-  # This might happen if load_checkpoint_from refers to a checkpoint
-  # but the index file cannot be found.
-  raise ValueError('Invalid load_checkpoint_from: %s' % load_checkpoint_from)
+          checkpoint_write_start = time.perf_counter()
+          checkpoint_saved = self.checkpointer.MaybeSave(
+              sess, self._model.global_step)
+          if checkpoint_saved:
+            checkpoint_write_secs = time.perf_counter() - checkpoint_write_start
+        train_steps_secs = time.perf_counter() - train_steps_start
+        self._ExportMetrics(
+            # Metrics expects python int, but global_step is numpy.int64.
+            global_step=int(global_step),
+            step_rate=step_rate,
+            example_rate=example_rate,
+            tpu_train_op_secs=tpu_train_op_secs,
+            checkpoint_write_secs=checkpoint_write_secs,
+            total_train_steps_secs=train_steps_secs)
 
 
 class Evaler(base_runner.BaseRunner):
@@ -941,7 +921,7 @@ class Evaler(base_runner.BaseRunner):
     self._eval_path = None
     # Multitask params doesn't have 'task'.
     if 'task' in self.params:
-      self._eval_path = _GetSpecificCheckpoint(
+      self._eval_path = checkpointer.GetSpecificCheckpoint(
           self.params.task.eval.load_checkpoint_from)
 
     self._summary_writer = self._CreateSummaryWriter(self._eval_dir)
@@ -952,8 +932,6 @@ class Evaler(base_runner.BaseRunner):
       with self._cluster, tf.device(self._cluster.GetPlacer()):
         self._model = self.params.Instantiate()
         self._params = self._model.params
-        # Always create the same graph to make sure node names are always
-        # exactly the same.
         self._model.ConstructFPropGraph()
         self._task = self._model.GetTask(self._model_task_name)
       self._initialize_tables = tf.tables_initializer()
@@ -1137,7 +1115,7 @@ class Decoder(base_runner.BaseRunner):
     self._decode_path = None
     # Multitask params doesn't have 'task'.
     if 'task' in self.params:
-      self._decode_path = _GetSpecificCheckpoint(
+      self._decode_path = checkpointer.GetSpecificCheckpoint(
           self.params.task.eval.load_checkpoint_from)
 
     self._summary_writer = self._CreateSummaryWriter(self._decoder_dir)
@@ -1272,7 +1250,8 @@ class Decoder(base_runner.BaseRunner):
         text_filename=os.path.join(self._decoder_dir,
                                    'score-{:08d}.txt'.format(global_step)))
     self._ExportMetrics(
-        decode_checkpoint=global_step,
+        # Metrics expects python int, but global_step is numpy.int64.
+        decode_checkpoint=int(global_step),
         dec_metrics=dec_metrics,
         example_rate=example_rate)
     # global_step and the checkpoint id from the checkpoint file might be

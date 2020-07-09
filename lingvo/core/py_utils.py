@@ -86,6 +86,12 @@ tf.flags.DEFINE_bool(
 tf.flags.DEFINE_bool('disable_py_utils_debug', False,
                      'If True disables all py_utils.Debug() logs.')
 
+# TODO(laigd): remove these after the migration.
+tf.flags.DEFINE_bool('if_use_tf_function', False,
+                     'If True use tf.function for py_utils.If().')
+tf.flags.DEFINE_bool('while_loop_use_tf_function', False,
+                     'If True use tf.function for py_utils.WhileLoop().')
+
 # NOTE: Using absl flags in libraries are frowned upon for several reasons:
 #
 # 1) They require app.run() or explicit flag parsing, preventing the use of
@@ -4133,7 +4139,17 @@ def _AssertInputsMatch(op, args, implicit_captures):
                       len(implicit_captures.Flatten()), implicit_captures))
 
 
-def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None):
+def _TensorSpecs(nmap):
+  """Transforms tensors in the input nested structure to TensorSpecs."""
+  return Transform(lambda t: tf.TensorSpec(t.shape, t.dtype), nmap)
+
+
+def _GetConcreteFunction(func, inputs):
+  """Returns a ConcreteFunction with specific input signature."""
+  return func.get_concrete_function(*Flatten(_TensorSpecs(inputs)))
+
+
+def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None, device=None):
   """Wraps fwd in a defun with custom gradient bak.
 
   Args:
@@ -4145,6 +4161,7 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None):
       must return its gradients in a Nested Structure as the last part of dxs.
     implicit_captures: A Nested Structure of tf.Tensor. Implicit inputs of fwd
       that are not listed in fwd_sig.
+    device: the device on which to run fwd and bak.
 
   Returns:
     A function that wraps fwd.
@@ -4189,7 +4206,7 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None):
       # Ensure dys contains no None.
       dys = ConvertNoneGradientToZeros(ys, dys)
 
-      with RemoveAssertContext(remove=noinline):
+      with RemoveAssertContext(remove=noinline), tf.device(device):
         dxs = bak(xs, ys, dys)
       return Flatten(dxs)
 
@@ -4203,7 +4220,7 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None):
     """The forward function."""
     for arg, shape in zip(args, arg_shapes):
       arg.set_shape(shape)
-    with RemoveAssertContext(remove=noinline):
+    with RemoveAssertContext(remove=noinline), tf.device(device):
       rets = fwd(Pack(arg_dtypes, args))
     sigs.rets = Transform(get_dtype, rets)
     return Flatten(rets)
@@ -4218,7 +4235,7 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None):
   return Call
 
 
-def CallDefun(fwd, args, bak=None):
+def CallDefun(fwd, args, bak=None, implicit_captures=None, device=None):
   """Wraps fwd in a defun with custom gradient bak and calls it with args.
 
   Args:
@@ -4226,11 +4243,14 @@ def CallDefun(fwd, args, bak=None):
     args: A Nested Structure of tf.Tensor.
     bak: A callable xs, ys, dys: Nested Structure -> dxs: Nested Structure. The
       custom backprop function for fwd.
+    implicit_captures: A Nested Structure of tf.Tensor. Implicit inputs of fwd
+      that are not listed in args.
+    device: the device on which to run fwd and bak.
 
   Returns:
     A Nested Structure equivalent to what fwd(args) computes.
   """
-  call = _DefineDefun(fwd, args, bak)
+  call = _DefineDefun(fwd, args, bak, implicit_captures, device)
   return call(args)
 
 
@@ -4271,25 +4291,45 @@ def If(cond, inputs, then_branch, else_branch):
     raise TypeError(
         'Outputs of then_branch and else_branch are not compatible.')
 
-  dtypes = inputs.Transform(lambda x: x.dtype).Flatten()
+  if _FromGlobal('if_use_tf_function'):
 
-  @tf.Defun(*dtypes)
-  def ThenBranch(*args):
-    inp = inputs.Pack(args)
-    out = then_branch(inp)
-    return out.Flatten()
+    @tf.function(autograph=False)
+    def ThenBranch(*args):
+      inp = inputs.Pack(args)
+      out = then_branch(inp)
+      return out.Flatten()
 
-  @tf.Defun(*dtypes)
-  def ElseBranch(*args):
-    inp = inputs.Pack(args)
-    out = else_branch(inp)
-    return out.Flatten()
+    @tf.function(autograph=False)
+    def ElseBranch(*args):
+      inp = inputs.Pack(args)
+      out = else_branch(inp)
+      return out.Flatten()
 
-  ret = tf.If(
-      cond=cond,
-      inputs=inputs.Flatten(),
-      then_branch=ThenBranch,
-      else_branch=ElseBranch)
+    ret = tf.If(
+        cond=cond,
+        inputs=inputs.Flatten(),
+        then_branch=_GetConcreteFunction(ThenBranch, inputs),
+        else_branch=_GetConcreteFunction(ElseBranch, inputs))
+  else:
+    dtypes = inputs.Transform(lambda x: x.dtype).Flatten()
+
+    @tf.Defun(*dtypes)
+    def ThenBranch(*args):
+      inp = inputs.Pack(args)
+      out = then_branch(inp)
+      return out.Flatten()
+
+    @tf.Defun(*dtypes)
+    def ElseBranch(*args):
+      inp = inputs.Pack(args)
+      out = else_branch(inp)
+      return out.Flatten()
+
+    ret = tf.If(
+        cond=cond,
+        inputs=inputs.Flatten(),
+        then_branch=ThenBranch,
+        else_branch=ElseBranch)
   return then_out.Pack(ret)
 
 
@@ -4311,21 +4351,40 @@ def WhileLoop(cond, body, loop_state):
     The final loop state in the same structure as loop_state.
   """
   state = NestedMap(loop_state=loop_state)
-  dtypes = state.Transform(lambda x: x.dtype).Flatten()
 
-  @tf.Defun(*dtypes)
-  def LoopCond(*args):
-    s = state.Pack(args)
-    return cond(s.loop_state)
+  if _FromGlobal('while_loop_use_tf_function'):
 
-  @tf.Defun(*dtypes)
-  def LoopBody(*args):
-    s = state.Pack(args)
-    s.loop_state = body(s.loop_state)
-    return s.Flatten()
+    @tf.function(autograph=False)
+    def LoopCond(*args):
+      s = state.Pack(args)
+      return cond(s.loop_state)
 
-  return state.Pack(
-      tf.While(input_=state.Flatten(), cond=LoopCond, body=LoopBody)).loop_state
+    @tf.function(autograph=False)
+    def LoopBody(*args):
+      s = state.Pack(args)
+      s.loop_state = body(s.loop_state)
+      return s.Flatten()
+
+    new_state = tf.While(
+        input_=state.Flatten(),
+        cond=_GetConcreteFunction(LoopCond, state),
+        body=_GetConcreteFunction(LoopBody, state))
+  else:
+    dtypes = state.Transform(lambda x: x.dtype).Flatten()
+
+    @tf.Defun(*dtypes)
+    def LoopCond(*args):
+      s = state.Pack(args)
+      return cond(s.loop_state)
+
+    @tf.Defun(*dtypes)
+    def LoopBody(*args):
+      s = state.Pack(args)
+      s.loop_state = body(s.loop_state)
+      return s.Flatten()
+
+    new_state = tf.While(input_=state.Flatten(), cond=LoopCond, body=LoopBody)
+  return state.Pack(new_state).loop_state
 
 
 def ForLoop(body, start, limit, delta, loop_state):

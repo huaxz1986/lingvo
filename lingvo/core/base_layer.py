@@ -25,8 +25,10 @@ from lingvo.core import cluster_factory
 from lingvo.core import hyperparams
 from lingvo.core import py_utils
 
+FLAGS = tf.flags.FLAGS
 
 _LAYER_STACK = py_utils.ThreadLocalStack()
+_CREATE_VARIABLES_STACK = py_utils.ThreadLocalStack()
 
 
 class Accumulator:
@@ -167,7 +169,6 @@ class BaseLayerMeta(type):
 
     cls.__init__ = _BaseLayerInitWrapper(cls.__init__)
     return cls
-
   # pylint: enable=bad-mcs-classmethod-argument
 
   def __call__(cls, *args, **kwargs):
@@ -526,7 +527,9 @@ class BaseLayer(tf.Module, metaclass=BaseLayerMeta):
     if self._is_variable_free:
       return self._private_children.Transform(lambda _: py_utils.NestedMap())
     if self._create_variables_status == _CreateVariablesStatus.NOT_CALLED:
-      raise ValueError('Cannot access vars before they have been created.')
+      raise ValueError(
+          'Cannot access vars for layer %s before they have been created.' %
+          self.params.cls)
     ret = self._private_children.Transform(lambda x: x.vars)
     for k in self._private_vars.keys():
       ret[k] = self._private_vars[k]
@@ -538,7 +541,9 @@ class BaseLayer(tf.Module, metaclass=BaseLayerMeta):
     if self._is_variable_free:
       return self._private_children.Transform(lambda _: py_utils.NestedMap())
     if self._create_variables_status == _CreateVariablesStatus.NOT_CALLED:
-      raise ValueError('Cannot access theta before they have been created.')
+      raise ValueError(
+          'Cannot access theta for layer %s before they have been created.' %
+          self.params.cls)
     ret = self._private_children.Transform(lambda x: x.theta)
 
     private_theta = self._private_theta
@@ -755,8 +760,13 @@ class BaseLayer(tf.Module, metaclass=BaseLayerMeta):
       meta: A CreateVariableMeta describing the variable to be created.
     """
     meta.kwargs.setdefault('default_seed', self.params.random_seed)
-    value, var = py_utils.CreateVariable(name, meta.var_params, **meta.kwargs)
+    var = py_utils.CreateVariable(name, meta.var_params, **meta.kwargs)
     self._private_vars[name] = var
+    if FLAGS.no_identity_on_vars:
+      value = var
+    else:
+      with tf.device(var.device):
+        value = tf.identity(var)
     if meta.theta_fn is not None:
       value = meta.theta_fn(value)
     self._private_theta[name] = value
@@ -770,20 +780,30 @@ class BaseLayer(tf.Module, metaclass=BaseLayerMeta):
       return
     self._create_variables_status = _CreateVariablesStatus.IN_PROGRESS
 
-    self._global_step = py_utils.GetGlobalStep()
-    self._CreateChildrenVariables()
+    stack_size = len(_CREATE_VARIABLES_STACK.stack)
+    _CREATE_VARIABLES_STACK.stack.append(self)
+    try:
+      self._global_step = py_utils.GetGlobalStep()
+      self._CreateChildrenVariables()
 
-    if not self._is_variable_free:
-      self.AddExtraTheta('global_step', self._global_step)
-      with tf.variable_scope(
-          py_utils.SanitizeScopeKey(self.params.name),
-          auxiliary_name_scope=False):
-        for name, meta in list(self._variables_to_create.items()):
-          self._CreateVariable(name, meta)
-        self._CreateVariables()
-    self._VerifyVarsAndTheta()
+      if not self._is_variable_free:
+        self.AddExtraTheta('global_step', self._global_step)
+        with tf.variable_scope(
+            py_utils.SanitizeScopeKey(self.params.name),
+            auxiliary_name_scope=False):
+          for name, meta in list(self._variables_to_create.items()):
+            self._CreateVariable(name, meta)
+          self._CreateVariables()
+    finally:
+      assert _CREATE_VARIABLES_STACK.stack[-1] is self
+      _CREATE_VARIABLES_STACK.stack.pop()
+      assert len(_CREATE_VARIABLES_STACK.stack) == stack_size
 
     self._create_variables_status = _CreateVariablesStatus.COMPLETED
+
+    if not _CREATE_VARIABLES_STACK.stack:
+      # Outermost layer just finished CreateVariables.
+      self._VerifyVarsAndTheta()
 
   def _CreateChildrenVariables(self):
     """Create variables for child layers.
@@ -918,6 +938,8 @@ class BaseLayer(tf.Module, metaclass=BaseLayerMeta):
 
   def _VerifyVarsAndTheta(self):
     """Verify that vars and theta have the same nested structure."""
+    for child in self._children_list:
+      child._VerifyVarsAndTheta()  # pylint: disable=protected-access
 
     def MatchKeys(x, y):
       assert len(x) <= len(y)

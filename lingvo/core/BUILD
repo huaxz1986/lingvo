@@ -723,6 +723,7 @@ py_library(
         ":computation_cost",
         ":constants",
         ":conv_layers_with_time_padding",
+        ":pruning_utils",
         ":py_utils",
         ":quant_utils",
         ":recurrent",
@@ -807,10 +808,10 @@ lingvo_cuda_py_test(
     srcs = ["conv_layers_builder_test.py"],
     python_version = "PY3",
     deps = [
-        ":base_layer",
+        ":bn_layers",
         ":conv_layers_builder",
+        ":conv_layers_with_time_padding",
         ":layers",
-        ":layers_test_lib",
         ":test_utils",
         # Implicit absl.testing.parameterized dependency.
         "//lingvo:compat",
@@ -911,12 +912,8 @@ py_library(
         ":scorers",
         "//lingvo:compat",
         # Implicit numpy dependency.
-    ] + select({
-        "//lingvo:py3_mode": [
-            # Implicit sklearn dependency.
-        ],
-        "//conditions:default": [],
-    }),
+        # Implicit sklearn dependency.
+    ],
 )
 
 py_library(
@@ -1127,6 +1124,16 @@ py_library(
 )
 
 py_library(
+    name = "pruning_utils",
+    srcs = ["pruning_utils.py"],
+    srcs_version = "PY3",
+    deps = [
+        # Implicit model_pruning.pruning dependency.
+        "//lingvo:compat",
+    ],
+)
+
+py_library(
     name = "py_utils",
     srcs = ["py_utils.py"],
     srcs_version = "PY3",
@@ -1135,7 +1142,6 @@ py_library(
         ":retry",
         ":symbolic",
         ":tshape",
-        # Implicit model_pruning.pruning dependency.
         "//lingvo:compat",
         "//lingvo/core/ops",
         # Implicit numpy dependency.
@@ -1163,6 +1169,7 @@ py_test(
         ":test_helper",
         ":test_utils",
         # Implicit absl.testing.flagsaver dependency.
+        # Implicit absl.testing.parameterized dependency.
         "//lingvo:compat",
         "//lingvo:model_registry",
         "//lingvo/tasks/image/params:mnist",
@@ -1647,6 +1654,8 @@ py_library(
     srcs_version = "PY3",
     deps = [
         ":hyperparams",
+        ":layers",
+        ":pruning_utils",
         ":py_utils",
         ":quant_utils",
         ":summary_utils",

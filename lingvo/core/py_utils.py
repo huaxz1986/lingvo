@@ -15,6 +15,11 @@
 # ==============================================================================
 """Common utilities."""
 
+# ==============================================================================
+# Note: Avoid adding dependencies to py_utils beyond standard python packages
+#       and tensorflow.
+# ==============================================================================
+
 import collections as py_collections
 import contextlib
 import functools
@@ -37,7 +42,6 @@ from lingvo.core import tshape
 import numpy as np
 import six
 
-from model_pruning.python import pruning
 # pylint: disable=g-direct-tensorflow-import
 from tensorflow.core.framework import node_def_pb2
 from tensorflow.core.protobuf import rewriter_config_pb2
@@ -91,6 +95,8 @@ tf.flags.DEFINE_bool('if_use_tf_function', False,
                      'If True use tf.function for py_utils.If().')
 tf.flags.DEFINE_bool('while_loop_use_tf_function', False,
                      'If True use tf.function for py_utils.WhileLoop().')
+tf.flags.DEFINE_bool('call_defun_use_tf_function', False,
+                     'If True use tf.function for py_utils.CallDefun().')
 
 # NOTE: Using absl flags in libraries are frowned upon for several reasons:
 #
@@ -1599,9 +1605,7 @@ def CreateVariable(name,
       Accepted values are constants defined in the class tf.VariableAggregation.
 
   Returns:
-    tf.identity(var), var pair. The tf.identity() node is colocated
-    with var. In the case of FLAGS.no_identity_on_vars, simply returns
-    a var, var pair.
+    The created variable.
   """
   p = params.Copy()
   shape = tf.TensorShape(ToStaticShape(p.shape)).as_list()
@@ -1793,13 +1797,7 @@ def CreateVariable(name,
             synchronization=synchronization,
             aggregation=aggregation)
 
-  if _FromGlobal('no_identity_on_vars'):
-    with tf.device(var.device):
-      return var, var
-  else:
-    # This tf.identity colocated with var.
-    with tf.device(var.device):
-      return tf.identity(var), var
+  return var
 
 
 _global_variable_scope = None
@@ -2584,29 +2582,6 @@ def ConcatRecursively(splits, axis=-1):
     return results
   else:
     raise TypeError('Unexpected type for ConcatRecursively: %s' % type(splits))
-
-
-def AddToPruningCollections(weight,
-                            mask,
-                            threshold,
-                            gradient=None,
-                            old_weight=None,
-                            old_old_weight=None):
-  """Add mask, threshold, and weight vars to their respective collections."""
-  if mask not in tf.get_collection(pruning.MASK_COLLECTION):
-    tf.add_to_collection(pruning.WEIGHT_COLLECTION, weight)
-    tf.add_to_collection(pruning.MASK_COLLECTION, mask)
-    tf.add_to_collection(pruning.THRESHOLD_COLLECTION, threshold)
-
-    # Add gradient, old_weight, and old_old_weight to collections approximating
-    # gradient and hessian, where old_weight is the weight tensor one step
-    # before and old_old_weight is the weight tensor two steps before.
-    if gradient is not None:
-      assert old_weight is not None
-      assert old_old_weight is not None
-      tf.add_to_collection(pruning.WEIGHT_GRADIENT_COLLECTION, gradient)
-      tf.add_to_collection(pruning.OLD_WEIGHT_COLLECTION, old_weight)
-      tf.add_to_collection(pruning.OLD_OLD_WEIGHT_COLLECTION, old_old_weight)
 
 
 def WeightedAvg(values, weights, sum_reduction_fn=tf.reduce_sum, name=''):
@@ -4245,6 +4220,110 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None, device=None):
   return Call
 
 
+def _DefineFunction(fwd,
+                    fwd_sig,
+                    bak=None,
+                    implicit_captures=None,
+                    device=None):
+  """Wraps fwd in a defun with custom gradient bak.
+
+  Args:
+    fwd: A callable xs: Nested Structure -> ys: Nested Structure.
+    fwd_sig: A Nested Structure of tf.Tensor representing the input signature of
+      fwd.
+    bak: A callable xs, ys, dys: Nested Structure -> dxs: Nested Structure. The
+      custom backprop function for fwd. If implicit_captures is not None, bak
+      must return its gradients in a Nested Structure as the last part of dxs.
+    implicit_captures: A Nested Structure of tf.Tensor. Implicit inputs of fwd
+      that are not listed in fwd_sig.
+    device: the device on which to run fwd and bak.
+
+  Returns:
+    A function that wraps fwd.
+  """
+  assert fwd is not None
+  noinline = not use_xla()
+
+  fwd_sig = _TensorSpecs(fwd_sig)
+  if implicit_captures:
+    # With custom_gradient, implicit captures need to be part of the input.
+    fwd_sig = [fwd_sig, _TensorSpecs(implicit_captures)]
+  else:
+    implicit_captures = NestedMap()
+
+  # Only used to hold the output dtypes of fwd in sigs.rets, which will be set
+  # in Forward.
+  sigs = NestedMap()
+
+  @tf.function(input_signature=Flatten(fwd_sig), autograph=False)
+  def Forward(*args):
+    """The forward function."""
+    with RemoveAssertContext(remove=noinline), tf.device(device):
+      xs = Pack(fwd_sig, args)
+      if implicit_captures:
+        xs, _ = xs  # Ignore implicit captures since fwd doesn't take that.
+      rets = fwd(xs)
+    sigs.rets = rets
+    return Flatten(rets)
+
+  # StackedRecurrent need this to perform send/recv across function boundary.
+  # TODO(laigd): make it an option and only use it in StackedRecurrent.
+  Forward._shared_rendezvous = True  # pylint: disable=protected-access
+
+  if bak:
+
+    def Backward(op, *args, **kwargs):
+      """Gradient function for the forward function.
+
+      Args:
+        op: The forward operation.
+        *args: Gradients wrt op.outputs.
+        **kwargs: Additional arguments from tf.custom_gradient.
+
+      Returns:
+        Tuple of derivatives.
+      """
+      if kwargs:
+        tf.logging.warning(
+            'Ignoring additional arguments used by tf.custom_gradient: %s',
+            str(kwargs))
+
+      # With tf.custom_gradient, implicit captures are always part of fwd's
+      # input signature.
+      _AssertInputsMatch(op, fwd_sig, NestedMap())
+      xs = Pack(fwd_sig, op.inputs)
+      if implicit_captures:
+        xs, _ = xs  # Ignore implicit captures since bak doesn't take that.
+      ys = Pack(sigs.rets, op.outputs)
+      dys = Pack(sigs.rets, args)
+
+      # Ensure dys contains no None.
+      dys = ConvertNoneGradientToZeros(ys, dys)
+
+      with RemoveAssertContext(remove=noinline), tf.device(device):
+        dxs = bak(xs, ys, dys)
+      return Flatten(dxs)
+
+    @tf.custom_gradient
+    def ForwardWithGrad(*args):
+      """Forward function and its custom gradient."""
+      op = NestedMap(inputs=args, outputs=Forward(*args))
+      return op.outputs, lambda *dys, **kwargs: Backward(op, *dys, **kwargs)
+
+    forward = ForwardWithGrad
+  else:
+    forward = Forward
+
+  def Call(args):
+    """Wrapper of fwd."""
+    flat_rets = forward(*Flatten([args, implicit_captures]))
+    if not isinstance(flat_rets, (tuple, list)):
+      flat_rets = [flat_rets]
+    return Pack(sigs.rets, flat_rets)
+
+  return Call
+
+
 def CallDefun(fwd, args, bak=None, implicit_captures=None, device=None):
   """Wraps fwd in a defun with custom gradient bak and calls it with args.
 
@@ -4260,7 +4339,11 @@ def CallDefun(fwd, args, bak=None, implicit_captures=None, device=None):
   Returns:
     A Nested Structure equivalent to what fwd(args) computes.
   """
-  call = _DefineDefun(fwd, args, bak, implicit_captures, device)
+  if _FromGlobal('call_defun_use_tf_function'):
+    fn = _DefineFunction
+  else:
+    fn = _DefineDefun
+  call = fn(fwd, args, bak, implicit_captures, device)
   return call(args)
 
 

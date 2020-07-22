@@ -4134,7 +4134,12 @@ def _GetConcreteFunction(func, inputs):
   return func.get_concrete_function(*Flatten(_TensorSpecs(inputs)))
 
 
-def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None, device=None):
+def _DefineDefun(fwd,
+                 fwd_sig,
+                 bak=None,
+                 bak_as_function=False,
+                 implicit_captures=None,
+                 device=None):
   """Wraps fwd in a defun with custom gradient bak.
 
   Args:
@@ -4144,6 +4149,7 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None, device=None):
     bak: A callable xs, ys, dys: Nested Structure -> dxs: Nested Structure. The
       custom backprop function for fwd. If implicit_captures is not None, bak
       must return its gradients in a Nested Structure as the last part of dxs.
+    bak_as_function: Whether to create a TF graph function for bak.
     implicit_captures: A Nested Structure of tf.Tensor. Implicit inputs of fwd
       that are not listed in fwd_sig.
     device: the device on which to run fwd and bak.
@@ -4155,7 +4161,7 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None, device=None):
 
   # fwd signature (tf.Tensor dtypes).
   get_dtype = lambda x: x.dtype
-  arg_dtypes = Transform(get_dtype, fwd_sig)
+  arg_dtypes = Flatten(Transform(get_dtype, fwd_sig))
 
   get_shape = lambda x: x.shape
   arg_shapes = Flatten(Transform(get_shape, fwd_sig))
@@ -4163,8 +4169,9 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None, device=None):
   compiled = use_xla()
   noinline = not compiled
 
-  # Only used to hold the output dtypes of fwd in sigs.rets, which will be set
-  # in Forward.
+  # Used to hold:
+  # - the output dtypes/shapes of fwd, which will be set in Forward.
+  # - the real Backward function used by Grad, which will be defined later.
   sigs = NestedMap()
 
   python_grad_func = None
@@ -4172,50 +4179,78 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None, device=None):
     if implicit_captures is None:
       implicit_captures = NestedMap()
 
-    def Backward(op, *args):
+    def Grad(op, *args):
       """Gradient function for the forward function.
 
       Args:
         op: The forward operation.
-        *args: Args to the backward operation (not including implicit captures).
+        *args: Gradients wrt op.outputs.
 
       Returns:
         Tuple of derivatives.
       """
       _AssertInputsMatch(op, fwd_sig, implicit_captures)
-      xs, _ = Pack([arg_dtypes, implicit_captures], op.inputs)
-      # Note: sigs.rets will be set during the Forward call.
-      ys = Pack(sigs.rets, op.outputs)
-      dys = Pack(sigs.rets, args)
-
       # Ensure dys contains no None.
-      dys = ConvertNoneGradientToZeros(ys, dys)
+      args = ConvertNoneGradientToZeros(list(op.outputs), list(args))
+      xs = op.inputs[:len(arg_dtypes)]  # The rest are captures.
+      return sigs.backward(*Flatten([xs, op.outputs, args]))
 
-      with RemoveAssertContext(remove=noinline), tf.device(device):
-        dxs = bak(xs, ys, dys)
-      return Flatten(dxs)
+    python_grad_func = Grad
 
-    python_grad_func = Backward
-
-  @tf.Defun(
-      *Flatten(arg_dtypes),
-      python_grad_func=python_grad_func,
-      noinline=noinline)
+  @tf.Defun(*arg_dtypes, python_grad_func=python_grad_func, noinline=noinline)
   def Forward(*args):
     """The forward function."""
     for arg, shape in zip(args, arg_shapes):
       arg.set_shape(shape)
     with RemoveAssertContext(remove=noinline), tf.device(device):
-      rets = fwd(Pack(arg_dtypes, args))
-    sigs.rets = Transform(get_dtype, rets)
+      rets = fwd(Pack(fwd_sig, args))
+    sigs.ret_dtypes = Transform(get_dtype, rets)
+    sigs.ret_shapes = Transform(get_shape, rets)
     return Flatten(rets)
+
+  if bak:
+
+    def Backward(*args):
+      """The backward function."""
+      xs_len = len(arg_dtypes)
+      ys_len = len(Flatten(sigs.ret_dtypes))
+      xs = args[:xs_len]
+      ys = args[xs_len:(xs_len + ys_len)]
+      dys = args[xs_len + ys_len:]
+      assert len(dys) == ys_len
+
+      for x, shape in zip(xs, arg_shapes):
+        x.set_shape(shape)
+      for y, dy, shape in zip(ys, dys, Flatten(sigs.ret_shapes)):
+        y.set_shape(shape)
+        dy.set_shape(shape)
+
+      xs = Pack(fwd_sig, xs)
+      ys = Pack(sigs.ret_dtypes, ys)
+      dys = Pack(sigs.ret_dtypes, dys)
+      with RemoveAssertContext(remove=noinline), tf.device(device):
+        dxs = bak(xs, ys, dys)
+      return Flatten(dxs)
+
+    if bak_as_function:
+      # Invokes fwd() to get sigs.ret_dtypes and sigs.ret_shapes.
+      Forward.add_to_graph(tf.get_default_graph())
+
+      sigs.backward = tf.Defun(
+          *Flatten([arg_dtypes, sigs.ret_dtypes, sigs.ret_dtypes]),
+          noinline=noinline)(
+              Backward)
+
+      sigs.backward.add_to_graph(tf.get_default_graph())
+    else:
+      sigs.backward = Backward
 
   def Call(args):
     """Wrapper of fwd."""
     flat_rets = Forward(*Flatten(args))
     if not isinstance(flat_rets, (tuple, list)):
       flat_rets = [flat_rets]
-    return Pack(sigs.rets, flat_rets)
+    return Pack(sigs.ret_dtypes, flat_rets)
 
   return Call
 
@@ -4223,6 +4258,7 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None, device=None):
 def _DefineFunction(fwd,
                     fwd_sig,
                     bak=None,
+                    bak_as_function=False,
                     implicit_captures=None,
                     device=None):
   """Wraps fwd in a defun with custom gradient bak.
@@ -4234,6 +4270,7 @@ def _DefineFunction(fwd,
     bak: A callable xs, ys, dys: Nested Structure -> dxs: Nested Structure. The
       custom backprop function for fwd. If implicit_captures is not None, bak
       must return its gradients in a Nested Structure as the last part of dxs.
+    bak_as_function: Whether to create a TF graph function for bak.
     implicit_captures: A Nested Structure of tf.Tensor. Implicit inputs of fwd
       that are not listed in fwd_sig.
     device: the device on which to run fwd and bak.
@@ -4241,6 +4278,7 @@ def _DefineFunction(fwd,
   Returns:
     A function that wraps fwd.
   """
+  del bak_as_function  # TODO(laigd): support this.
   assert fwd is not None
   noinline = not use_xla()
 
@@ -4324,7 +4362,12 @@ def _DefineFunction(fwd,
   return Call
 
 
-def CallDefun(fwd, args, bak=None, implicit_captures=None, device=None):
+def CallDefun(fwd,
+              args,
+              bak=None,
+              bak_as_function=False,
+              implicit_captures=None,
+              device=None):
   """Wraps fwd in a defun with custom gradient bak and calls it with args.
 
   Args:
@@ -4332,6 +4375,7 @@ def CallDefun(fwd, args, bak=None, implicit_captures=None, device=None):
     args: A Nested Structure of tf.Tensor.
     bak: A callable xs, ys, dys: Nested Structure -> dxs: Nested Structure. The
       custom backprop function for fwd.
+    bak_as_function: Whether to create a TF graph function for bak.
     implicit_captures: A Nested Structure of tf.Tensor. Implicit inputs of fwd
       that are not listed in args.
     device: the device on which to run fwd and bak.
@@ -4343,7 +4387,7 @@ def CallDefun(fwd, args, bak=None, implicit_captures=None, device=None):
     fn = _DefineFunction
   else:
     fn = _DefineDefun
-  call = fn(fwd, args, bak, implicit_captures, device)
+  call = fn(fwd, args, bak, bak_as_function, implicit_captures, device)
   return call(args)
 
 
@@ -4352,78 +4396,70 @@ def If(cond, inputs, then_branch, else_branch):
 
   Args:
     cond: A scalar `Tensor` that can be converted to boolean.
-    inputs: A NestedMap representing the input tensors of the if/else statement.
-    then_branch: A callable 'inputs' -> NestedMap. The returned NestedMap should
-      be compatible with what 'else_branch' returns.
-    else_branch: A callable 'inputs' -> NestedMap. The returned NestedMap should
-      be compatible with what 'then_branch' returns.
+    inputs: A flattenable representing the input tensors of the if/else
+      statement.
+    then_branch: A callable 'inputs' -> flattenable. The returned value
+      should be compatible with what 'else_branch' returns.
+    else_branch: A callable 'inputs' -> flattenable. The returned value
+      should be compatible with what 'then_branch' returns.
 
   Returns:
-    NestedMap returned by the call to either 'then_branch' or 'else_branch'.
-
-  Raises:
-    TypeError: if
-      - 'inputs' is not a NestedMap, or
-      - 'then_branch' or 'else_branch' doesn't return a NestedMap, or
-      - the outputs of 'then_branch' and 'else_branch' are not compatible.
+    Output returned by the call to either 'then_branch' or 'else_branch'.
   """
-  if not isinstance(inputs, NestedMap):
-    raise TypeError('inputs must be a NestedMap, got %s' % type(inputs))
-
-  then_out = then_branch(inputs)
-  if not isinstance(then_out, NestedMap):
-    raise TypeError('then_branch must return a NestedMap, got %s' %
-                    type(then_out))
-
-  else_out = else_branch(inputs)
-  if not isinstance(else_out, NestedMap):
-    raise TypeError('else_branch must return a NestedMap, got %s' %
-                    type(else_out))
-
-  if not then_out.IsCompatible(else_out):
-    raise TypeError(
-        'Outputs of then_branch and else_branch are not compatible.')
+  ret_dtypes = NestedMap()
+  get_dtype = lambda x: x.dtype
 
   if _FromGlobal('if_use_tf_function'):
 
     @tf.function(autograph=False)
     def ThenBranch(*args):
-      inp = inputs.Pack(args)
+      inp = Pack(inputs, args)
       out = then_branch(inp)
-      return out.Flatten()
+      ret_dtypes.then_out = Transform(get_dtype, out)
+      return Flatten(out)
 
     @tf.function(autograph=False)
     def ElseBranch(*args):
-      inp = inputs.Pack(args)
+      inp = Pack(inputs, args)
       out = else_branch(inp)
-      return out.Flatten()
+      ret_dtypes.else_out = Transform(get_dtype, out)
+      return Flatten(out)
 
     ret = tf.If(
         cond=cond,
-        inputs=inputs.Flatten(),
+        inputs=Flatten(inputs),
         then_branch=_GetConcreteFunction(ThenBranch, inputs),
         else_branch=_GetConcreteFunction(ElseBranch, inputs))
   else:
-    dtypes = inputs.Transform(lambda x: x.dtype).Flatten()
+    dtypes = Flatten(Transform(lambda x: x.dtype, inputs))
 
     @tf.Defun(*dtypes)
     def ThenBranch(*args):
-      inp = inputs.Pack(args)
+      for dst, src in zip(args, Flatten(inputs)):
+        dst.set_shape(src.shape)
+      inp = Pack(inputs, args)
       out = then_branch(inp)
-      return out.Flatten()
+      ret_dtypes.then_out = Transform(get_dtype, out)
+      return Flatten(out)
 
     @tf.Defun(*dtypes)
     def ElseBranch(*args):
-      inp = inputs.Pack(args)
+      for dst, src in zip(args, Flatten(inputs)):
+        dst.set_shape(src.shape)
+      inp = Pack(inputs, args)
       out = else_branch(inp)
-      return out.Flatten()
+      ret_dtypes.else_out = Transform(get_dtype, out)
+      return Flatten(out)
 
     ret = tf.If(
         cond=cond,
-        inputs=inputs.Flatten(),
+        inputs=Flatten(inputs),
         then_branch=ThenBranch,
         else_branch=ElseBranch)
-  return then_out.Pack(ret)
+
+  assert IsCompatible(ret_dtypes.then_out, ret_dtypes.else_out), (
+      'Outputs of then_branch and else_branch are not compatible.')
+  return Pack(ret_dtypes.then_out, ret)
 
 
 def _Itype():

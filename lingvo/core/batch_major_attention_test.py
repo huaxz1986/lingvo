@@ -1206,6 +1206,38 @@ class TransformerLayerTest(test_utils.TestCase, parameterized.TestCase):
       ctx1, ctx2 = sess.run([ctx_vec1, ctx_vec2])
       self.assertAllClose(ctx1, ctx2)
 
+  def testTransformerAttentionLayerNoLayernorm(self):
+    """Verify if Transformer attention allows no layernorm in FProp and Extend."""
+    with self.session(use_gpu=True) as sess:
+      query_vec, _, _, _ = self._TransformerAttentionLayerInputs()
+      paddings = tf.zeros([2, 5])
+      cached_key = tf.zeros([5, 2, 2, 2])
+      cached_value = tf.zeros([5, 2, 2, 2])
+      prefix_states = py_utils.NestedMap(key=cached_key, value=cached_value)
+
+      p = attention.TransformerAttentionLayer.Params().Set(
+          name='transformer_atten',
+          input_dim=4,
+          is_masked=True,
+          num_heads=2,
+          ln_tpl=None)  # Set ln_tpl to None.
+      p.params_init = py_utils.WeightInit.Xavier(scale=1.0, seed=0)
+      l = p.Instantiate()
+
+      ctx_vec1, _ = l.FProp(l.theta, query_vec, None, paddings)
+
+      ctx_vec2 = []
+      for i in range(5):
+        ctx_vec, prefix_states = l.ExtendStep(
+            l.theta, tf.expand_dims(query_vec[:, i, :], 1), prefix_states, i,
+            False)
+        ctx_vec2.append(tf.squeeze(ctx_vec, 1))
+      ctx_vec2 = tf.transpose(tf.stack(ctx_vec2), [1, 0, 2])
+
+      tf.global_variables_initializer().run()
+      ctx1, ctx2 = sess.run([ctx_vec1, ctx_vec2])
+      self.assertAllClose(ctx1, ctx2)
+
   def _ConstructTransformerDecoderLayer(self, use_relative_atten=False):
     p = attention.TransformerDecoderLayer.Params()
     p.name = 'transformer_decoder_layer'
@@ -1638,6 +1670,48 @@ class BuilderTest(test_utils.TestCase, parameterized.TestCase):
       tf.global_variables_initializer().run()
       actual_enc_out = sess.run(enc_out)
       self.assertAllEqual([bs, out_seq_len, d], actual_enc_out.shape)
+
+
+class LmBuilderTest(test_utils.TestCase):
+
+  def _testGraph(self, dtype=tf.float32):
+    tf.random.set_seed(398847392)
+    np.random.seed(12345)
+    atten_builder = attention.LmBuilder.Params().Set(
+        model_dim=4, num_heads=2, ff_hidden_dim=16)
+    params = atten_builder.Instantiate().TransformerEncoderStack(
+        name='xformer', num_layers=2)
+    params.dtype = dtype
+    params.random_seed = 0
+    params.params_init = py_utils.WeightInit.Xavier(scale=1.0, seed=0)
+    l = params.Instantiate()
+    l_in = tf.constant(np.random.rand(2, 3, 4), dtype=dtype)
+    l_padding = tf.zeros([2, 3], dtype=dtype)
+    l_out = l.FPropDefaultTheta(
+        py_utils.NestedMap(vec=l_in, paddings=l_padding))
+    return l_out.vec
+
+  def testFprop(self):
+    with self.session(use_gpu=False, graph=tf.Graph()) as sess:
+      l_out = self._testGraph()
+      l_out = tf.reduce_sum(l_out)
+      tf.global_variables_initializer().run()
+      l_out_eval = sess.run(l_out)
+      self.assertAllClose(35.050835, l_out_eval)
+
+  def testBProp(self):
+    with self.session(use_gpu=True) as sess:
+      output = self._testGraph(dtype=tf.float64)
+      loss = tf.reduce_sum(output)
+      all_vars = tf.trainable_variables()
+      grads = tf.gradients(loss, all_vars)
+      tf.global_variables_initializer().run()
+      sym_grads = [sg.eval() for sg in grads]
+      num_grads = [
+          test_utils.ComputeNumericGradient(sess, loss, v) for v in all_vars
+      ]
+      for ng, sg in zip(num_grads, sym_grads):
+        self.assertAllClose(ng, sg, rtol=5e-02, atol=5e-02)
 
 
 def _CreateDummyParams(field_names):

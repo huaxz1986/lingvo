@@ -1324,9 +1324,10 @@ def DefaultParamInit():
   return WeightInit.Xavier(_DEFAULT_XAVIER_INIT)
 
 
+# TODO(rpang, jonathanasdf): explore adding _is_default to hyperparams.Param.
 def IsDefaultParamInit(p):
-  return (p.method == 'xavier' and p.scale == _DEFAULT_XAVIER_INIT and
-          p.seed is None)
+  return (p.method == 'xavier' and
+          abs(p.scale - _DEFAULT_XAVIER_INIT) < 1e-7 and p.seed is None)
 
 
 def WeightParams(shape, init=None, dtype=None, collections=None):
@@ -1748,7 +1749,7 @@ def CreateVariable(name,
       return next_creator(**kwargs)
     except ValueError:  # Possibly the variable already exists
       if GetOpportunisticVariableReuse():
-        with tf.variable_scope(tf.get_variable_scope(), reuse=True):
+        with tf.variable_scope(tf.get_variable_scope(), reuse=tf.AUTO_REUSE):
           return next_creator(**kwargs)
       else:
         raise

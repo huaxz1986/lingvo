@@ -192,7 +192,7 @@ def _PadForLengthCompatibleStridesV2(tensor, stride, padding_algorithm,
 
 
 class BaseConv2DLayerWithPadding(base_layer.BaseLayer):
-  """Base class for 2D convolution layers.
+  """Abstract base class for 2D convolution layers.
 
   WARNING: Strided convolutions are buggy. Prefer using v2_padding=True.
   """
@@ -260,6 +260,10 @@ class BaseConv2DLayerWithPadding(base_layer.BaseLayer):
   def input_channels(self):
     """The number of input channels for this conv layer."""
     return self.params.filter_shape[2]
+
+  @property
+  def filter_stride(self):
+    return self.params.filter_stride
 
   def OutShape(self, in_shape):
     """Compute the output shape given the input shape."""
@@ -378,8 +382,8 @@ class Conv2DLayerWithPadding(BaseConv2DLayerWithPadding):
     p.Define('bias', False, 'Whether or not to apply a bias before activation.')
     return p
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
     w_pc = py_utils.WeightParams(
         shape=p.filter_shape,
@@ -492,8 +496,8 @@ class DepthwiseConv2DLayer(BaseConv2DLayerWithPadding):
     p.Define('bias', False, 'Whether or not to apply a bias before activation.')
     return p
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
     w_pc = py_utils.WeightParams(
         shape=p.filter_shape,

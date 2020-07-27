@@ -1365,6 +1365,31 @@ class TransformerLayerTest(test_utils.TestCase, parameterized.TestCase):
     p.random_seed = 12345
     return p.Instantiate()
 
+  def testStackedTransformerGetSplitForLayer(self):
+    cls = attention.StackedTransformerLayers
+
+    buckets = [2, 4, 5, 6, 9, 11, 15]
+    ys = [cls.GetSplitForLayer(buckets, i) for i in range(16)]
+    self.assertEqual(0, ys[0])
+    self.assertEqual(0, ys[1])
+    self.assertEqual(0, ys[2])
+    self.assertEqual(1, ys[3])
+
+    self.assertEqual(1, ys[4])
+    self.assertEqual(2, ys[5])
+    self.assertEqual(3, ys[6])
+    self.assertEqual(4, ys[7])
+
+    self.assertEqual(4, ys[8])
+    self.assertEqual(4, ys[9])
+    self.assertEqual(5, ys[10])
+    self.assertEqual(5, ys[11])
+
+    self.assertEqual(6, ys[12])
+    self.assertEqual(6, ys[13])
+    self.assertEqual(6, ys[14])
+    self.assertEqual(6, ys[15])
+
   def testTransformerEncoderLayerStackFProp(self):
     with self.session(use_gpu=True) as sess:
       (query_vec, paddings, _, _) = self._TransformerAttentionLayerInputs()
@@ -1671,6 +1696,38 @@ class BuilderTest(test_utils.TestCase, parameterized.TestCase):
       actual_enc_out = sess.run(enc_out)
       self.assertAllEqual([bs, out_seq_len, d], actual_enc_out.shape)
 
+  def testEncoderLayerWithPerLayerParam(self):
+    with self.session(use_gpu=False) as sess:
+      bs = 2
+      sl = 10
+      d = 16
+      tf.random.set_seed(398847392)
+      np.random.seed(12345)
+      heads = [1, 2, 4]
+      ff_dims = [16, 32, 16]
+      atten_builder = attention.Builder.Params().Set(
+          model_dim=16, num_heads=heads, ff_hidden_dim=ff_dims).Instantiate()
+      layers = []
+      for layer_i, (head, ff_dim) in enumerate(zip(heads, ff_dims)):
+        layers.append(
+            atten_builder.TransformerEncoderLayer(
+                name='atten_{}'.format(layer_i),
+                ff_hidden_dim=ff_dim,
+                num_heads=head,
+                stride=1 if layer_i < 2 else 0))
+      p = atten_builder.Seq('model', *layers)
+      p.params_init = py_utils.WeightInit.Xavier(scale=1.0, seed=0)
+      l = p.Instantiate()
+      input_embs = tf.constant(
+          np.random.random(size=[bs, sl, d]), dtype=np.float)
+      paddings = tf.zeros([bs, sl])
+      l_out = l.FPropDefaultTheta(
+          py_utils.NestedMap(vec=input_embs, paddings=paddings))
+      out = tf.reduce_sum(l_out.vec)
+      tf.global_variables_initializer().run()
+      actual_out = sess.run(out)
+      self.assertAllClose(actual_out, 17.40516)
+
 
 class LmBuilderTest(test_utils.TestCase):
 
@@ -1678,7 +1735,7 @@ class LmBuilderTest(test_utils.TestCase):
     tf.random.set_seed(398847392)
     np.random.seed(12345)
     atten_builder = attention.LmBuilder.Params().Set(
-        model_dim=4, num_heads=2, ff_hidden_dim=16)
+        model_dim=4, num_heads=2, ff_hidden_dim=16, dtype=dtype)
     params = atten_builder.Instantiate().TransformerEncoderStack(
         name='xformer', num_layers=2)
     params.dtype = dtype
@@ -1697,7 +1754,7 @@ class LmBuilderTest(test_utils.TestCase):
       l_out = tf.reduce_sum(l_out)
       tf.global_variables_initializer().run()
       l_out_eval = sess.run(l_out)
-      self.assertAllClose(35.050835, l_out_eval)
+      self.assertAllClose(36.04808, l_out_eval)
 
   def testBProp(self):
     with self.session(use_gpu=True) as sess:

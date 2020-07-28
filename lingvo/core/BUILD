@@ -68,6 +68,7 @@ py_library(
         ":hyperparams",
         ":layers",
         ":layers_with_attention",
+        ":moe_layers",
         ":py_utils",
         ":relative_atten_util",
         ":symbolic",
@@ -1820,6 +1821,17 @@ py_library(
     srcs_version = "PY3",
     deps = [
         ":rnn_layers",
+        "//lingvo:compat",
+    ],
+)
+
+py_library(
+    name = "moe_layers",
+    srcs = ["moe_layers.py"],
+    deps = [
+        ":base_layer",
+        ":py_utils",
+        ":tpu_summary",
         "//lingvo:compat",
     ],
 )

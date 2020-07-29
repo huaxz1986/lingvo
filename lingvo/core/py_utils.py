@@ -522,25 +522,17 @@ def HasShape(tensor, expected_shape, ndims=None):
                                                filepath), line, func)
 
   tensor_shape = GetShape(tensor)
+  if ndims is not None:
+    tensor_shape = tensor_shape[:ndims]
+
+  # TODO(jngiam): Attempt to switch back to tf.Assert after it has better
+  # support on GPUs.
+  assert_op = ops.assert_shape_match(tensor_shape, expected_shape, msg=msg)
 
   # If expected_shape is a Tensor, then we are unable to perform static checks.
   # In this case, we can do a dynamic check and return.
   if isinstance(expected_shape, tf.Tensor):
-    if ndims is not None:
-      tensor_shape = tensor_shape[:ndims]
-    return with_dependencies([
-        tf.Assert(
-            tf.reduce_all(
-                tf.logical_or(
-                    tf.math.equal(
-                        tf.cast(tensor_shape, tf.int32),
-                        tf.cast(expected_shape, tf.int32)),
-                    tf.math.equal(expected_shape, -1))),
-            [
-                msg, 'Tensor does not match expected shape:', 'Tensor shape: ',
-                tensor_shape, ' Expected shape: ', expected_shape
-            ])
-    ], tensor)
+    return with_dependencies([assert_op], tensor)
 
   # Infer ranks from the inputs.
   expected_rank = len(expected_shape)
@@ -581,27 +573,21 @@ def HasShape(tensor, expected_shape, ndims=None):
       v.value if isinstance(v, tf.Dimension) else v for v in expected_shape
   ]
 
-  assert_ops = []
+  all_static_checks = True
   for idx, (dim, expected_dim) in enumerate(zip(tensor_shape, expected_shape)):
     if expected_dim == -1:
       continue
     if isinstance(dim, tf.Tensor) or isinstance(expected_dim, tf.Tensor):
-      assert_ops.append(
-          tf.Assert(
-              tf.logical_or(
-                  tf.math.equal(
-                      tf.cast(dim, tf.int32), tf.cast(expected_dim, tf.int32)),
-                  tf.math.equal(expected_dim, -1)), [
-                      msg, 'Tensor does not match expected shape on dimension:',
-                      idx, 'Tensor shape: ', tensor_shape, ' Expected shape: ',
-                      expected_shape
-                  ]))
+      all_static_checks = False
     elif dim != expected_dim:
       raise ValueError('Tensor does not match expected shape on dimension {}.\n'
                        'Tensor shape: {} Expected shape: {}'.format(
                            idx, tensor_shape, expected_shape))
 
-  return with_dependencies(assert_ops, tensor)
+  if all_static_checks:
+    return tf.convert_to_tensor(tensor)
+  else:
+    return with_dependencies([assert_op], tensor)
 
 
 def GetSize(tensor):
@@ -4362,19 +4348,19 @@ def _DefineFunction(fwd,
   Returns:
     A function that wraps fwd.
   """
-  del bak_as_function  # TODO(laigd): support this.
   assert fwd is not None
   noinline = not use_xla()
 
-  fwd_sig = _TensorSpecs(fwd_sig)
+  fwd_sig_no_captures = _TensorSpecs(fwd_sig)
   if implicit_captures:
     # With custom_gradient, implicit captures need to be part of the input.
-    fwd_sig = [fwd_sig, _TensorSpecs(implicit_captures)]
+    fwd_sig = [fwd_sig_no_captures, _TensorSpecs(implicit_captures)]
   else:
+    fwd_sig = fwd_sig_no_captures
     implicit_captures = NestedMap()
 
-  # Only used to hold the output dtypes of fwd in sigs.rets, which will be set
-  # in Forward.
+  # Only used to hold the output signature of fwd in sigs.rets, which will be
+  # set in Forward.
   sigs = NestedMap()
 
   @tf.function(input_signature=Flatten(fwd_sig), autograph=False)
@@ -4385,52 +4371,73 @@ def _DefineFunction(fwd,
       if implicit_captures:
         xs, _ = xs  # Ignore implicit captures since fwd doesn't take that.
       rets = fwd(xs)
-    sigs.rets = rets
+    sigs.rets = _TensorSpecs(rets)
     return Flatten(rets)
 
   # StackedRecurrent need this to perform send/recv across function boundary.
   # TODO(laigd): make it an option and only use it in StackedRecurrent.
   Forward._shared_rendezvous = True  # pylint: disable=protected-access
+  forward_cf = Forward.get_concrete_function()
+  forward_cf.add_to_graph()
 
   if bak:
 
-    def Backward(op, *args, **kwargs):
-      """Gradient function for the forward function.
-
-      Args:
-        op: The forward operation.
-        *args: Gradients wrt op.outputs.
-        **kwargs: Additional arguments from tf.custom_gradient.
-
-      Returns:
-        Tuple of derivatives.
-      """
-      if kwargs:
-        tf.logging.warning(
-            'Ignoring additional arguments used by tf.custom_gradient: %s',
-            str(kwargs))
-
-      # With tf.custom_gradient, implicit captures are always part of fwd's
-      # input signature.
-      _AssertInputsMatch(op, fwd_sig, NestedMap())
-      xs = Pack(fwd_sig, op.inputs)
-      if implicit_captures:
-        xs, _ = xs  # Ignore implicit captures since bak doesn't take that.
-      ys = Pack(sigs.rets, op.outputs)
-      dys = Pack(sigs.rets, args)
-
-      # Ensure dys contains no None.
-      dys = ConvertNoneGradientToZeros(ys, dys)
-
+    def Backward(*args):
+      xs_len = len(Flatten(fwd_sig_no_captures))
+      ys_len = len(Flatten(sigs.rets))
+      xs = Pack(fwd_sig_no_captures, args[:xs_len])
+      ys = Pack(sigs.rets, args[xs_len:(xs_len + ys_len)])
+      dys = Pack(sigs.rets, args[xs_len + ys_len:])
       with RemoveAssertContext(remove=noinline), tf.device(device):
         dxs = bak(xs, ys, dys)
       return Flatten(dxs)
 
+    if bak_as_function:
+      backward = tf.function(
+          Backward,
+          input_signature=Flatten([fwd_sig_no_captures, sigs.rets, sigs.rets]),
+          autograph=False)
+      # Add the backward function to graph so it's invoked under the same
+      # context as forward. This is necessary if the function body captures any
+      # non-tensor values from the environment, like symbolic maps.
+      backward_cf = backward.get_concrete_function()
+      backward_cf.add_to_graph()
+    else:
+      backward_cf = Backward
+
     @tf.custom_gradient
     def ForwardWithGrad(*args):
       """Forward function and its custom gradient."""
-      op = NestedMap(inputs=args, outputs=Forward(*args))
-      return op.outputs, lambda *dys, **kwargs: Backward(op, *dys, **kwargs)
+      op = NestedMap(inputs=args, outputs=forward_cf(*args))
+
+      def Grad(*args, **kwargs):
+        """Gradient function for the forward function.
+
+        Args:
+          *args: Gradients wrt op.outputs.
+          **kwargs: Additional arguments from tf.custom_gradient.
+
+        Returns:
+          Tuple of derivatives.
+        """
+        if kwargs:
+          tf.logging.warning(
+              'Ignoring additional arguments used by tf.custom_gradient: %s',
+              str(kwargs))
+
+        # With tf.custom_gradient, implicit captures are always part of fwd's
+        # input signature.
+        _AssertInputsMatch(op, fwd_sig, NestedMap())
+
+        # Ensure dys contains no None.
+        args = ConvertNoneGradientToZeros(list(op.outputs), list(args))
+
+        xs = Pack(fwd_sig, op.inputs)
+        if implicit_captures:
+          xs, _ = xs  # Ignore implicit captures since bak doesn't take that.
+        return backward_cf(*Flatten([xs, op.outputs, args]))
+
+      return op.outputs, Grad
 
     forward = ForwardWithGrad
   else:

@@ -1279,6 +1279,11 @@ class FeedForwardNet(quant_utils.QuantizableLayer):
         ' tuple/list of strings having the same length as the number'
         ' of layers.')
     p.Define(
+        'has_bias', None, 'Whether or not to use bias for projection layers.'
+        'This can be a None, single bool or a tuple/list of bools having the '
+        'same length as the number of layers. If None, the has_bias is set to '
+        'True whenever batch_norm is False for each projection layer.')
+    p.Define(
         'weight_norm', False,
         'Whether or not to apply weight normalization to weights. This can be '
         'a single bool or a tuple/list of bools having the same length as the '
@@ -1314,6 +1319,15 @@ class FeedForwardNet(quant_utils.QuantizableLayer):
       activation = [activation] * num_layers
     else:
       assert len(activation) == num_layers
+    has_bias = p.has_bias
+    if isinstance(has_bias, (list, tuple)):
+      assert len(has_bias) == num_layers
+    else:
+      has_bias = [has_bias] * num_layers
+    # Set has_bias to (not batch_norm) if None.
+    for i in range(num_layers):
+      if has_bias[i] is None:
+        has_bias[i] = (not batch_norm[i])
     params_dropout_layers = p.dropout
     if isinstance(params_dropout_layers, (list, tuple)):
       assert len(params_dropout_layers) == num_layers
@@ -1331,7 +1345,7 @@ class FeedForwardNet(quant_utils.QuantizableLayer):
       params_i = p.projection.Copy().Set(
           batch_norm=batch_norm[i],
           weight_norm=weight_norm[i],
-          has_bias=(not batch_norm[i]),
+          has_bias=has_bias[i],
           activation=activation[i],
           input_dim=in_dim,
           output_dim=proj_out_dim,
@@ -2099,8 +2113,12 @@ class TPUEmbeddingTable(base_layer.BaseLayer):
                 tf.assign(accumulator_var, retrieved_accumulator))
             self._retrieve_op_list.append(retrieve_parameters_op)
 
-    self._private_vars['wm'] = embedding_table_vars
-    self._private_theta['wm'] = [tf.identity(v) for v in embedding_table_vars]
+    if not py_utils.use_tpu():
+      # We dont't want to add this for TrainerTpu, otherwise the identity
+      # reference leads to copying the embedding to the TPU for no reason.
+      # However, this is needed for CPU (eval/decode/controller).
+      self._private_vars['wm'] = embedding_table_vars
+      self._private_theta['wm'] = [tf.identity(v) for v in embedding_table_vars]
 
   @property
   def table_config(self):

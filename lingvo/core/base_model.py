@@ -248,7 +248,6 @@ class BaseTask(base_layer.BaseLayer):
     self._post_train_ops = []
     self._eval_metrics = {}
     self._per_example = {}
-    self._trainer_verbose_tensors = {}
 
     # Create the gradient mask,
     self._per_input_gradient_mask = None
@@ -561,20 +560,21 @@ class BaseTask(base_layer.BaseLayer):
       }
     all_losses = []
     for optimization in self.learners:
-      loss_name = optimization.params.name
+      learner_name = optimization.params.name
+      loss_name = optimization.params.loss_name or learner_name
       metric = self._metrics.get(loss_name, None)
       if metric is None:
         raise ValueError('Loss %s not found in metrics %s' %
                          (loss_name, list(self._metrics.keys())))
       loss = metric[0]
       all_losses.append(loss)
-      train_ops['train/%s' % loss_name], eval_metrics = optimization.Apply(
+      train_ops['train/%s' % learner_name], eval_metrics = optimization.Apply(
           loss,
           vmap,
           gradient_mask=gradient_mask,
           gradient_adjuster=self.AdjustGradients)
       for key, (value, weight) in eval_metrics.items():
-        self.AddEvalMetric(key + '/' + loss_name, value, weight)
+        self.AddEvalMetric(key + '/' + learner_name, value, weight)
 
     relevant_bn_updates, _ = py_utils.FindRelevantBatchNormUpdates(
         all_losses, tf.get_collection(py_utils.BATCH_NORM_UPDATES))
@@ -804,26 +804,6 @@ class BaseTask(base_layer.BaseLayer):
     if name in self._per_example:
       raise ValueError('Metric %s has already been defined.' % name)
     self._per_example[name] = value
-
-  @property
-  def trainer_verbose_tensors(self):
-    """Return the dict of verbose tensors to eval in the training loop."""
-    return self._trainer_verbose_tensors
-
-  def AddTrainerVerboseTensor(self, name, target):
-    """Add a (set of) tensors to be evaluated in the training loop.
-
-    Args:
-      name: A python string. The name of the target(s).
-      target: A Tensor or a list or dict of Tensors.
-
-    Raises:
-      ValueError: if `name` is already defined.
-
-    """
-    if name in self._trainer_verbose_tensors:
-      raise ValueError('Verbose target %s has already been defined.' % name)
-    self._trainer_verbose_tensors[name] = target
 
   def _UpdateVnConfig(self):
     """Update vn config from the various vn flags."""

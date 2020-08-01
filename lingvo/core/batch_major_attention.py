@@ -245,6 +245,11 @@ class MultiHeadedAttention(base_layer.BaseLayer):
     p.Define('packed_input', False, 'Whether there is packed input.')
     p.Define('use_bias', True, 'Whether to use bias for projection layers.')
     p.Define('xla_num_partitions', None, 'Number of SPMD partitions.')
+    p.Define(
+        'enable_scaling_code_motion', False, 'Move scalings from the side '
+        'of T^2 to the side of T for better performance. This may result '
+        'in model quality drops when using bf16 for some models due to '
+        'different XLA fusion decisions.')
     return p
 
   def __init__(self, params):
@@ -348,7 +353,7 @@ class MultiHeadedAttention(base_layer.BaseLayer):
         not None.
 
     Returns:
-      unscaled_probs: [B, N, T, S].
+      probs: [B, N, T, S].
       probs_sum: [B, N, T, 1].
     """
     key = py_utils.HasRank(key, 4)
@@ -382,15 +387,19 @@ class MultiHeadedAttention(base_layer.BaseLayer):
           tf.constant(-0.7, dtype=logits.dtype))
       padded_logits = tf.where(paddings > 0.0, very_negative_logits, logits)
 
-    # Split the softmax into two parts. Do the 1st part here; the 2nd part
-    # (scaling) is moved after _AttenContext for better performance.
-    unscaled_probs = padded_logits - tf.stop_gradient(
-        tf.reduce_max(padded_logits, -1, True))
-    unscaled_probs = tf.exp(unscaled_probs)
-    probs_sum = tf.reduce_sum(unscaled_probs, -1, True)
+    if self.params.enable_scaling_code_motion:
+      # Split the softmax into two parts. Do the 1st part here; the 2nd part
+      # (scaling) is moved after _AttenContext for better performance.
+      probs = padded_logits - tf.stop_gradient(
+          tf.reduce_max(padded_logits, -1, True))
+      probs = tf.cast(tf.exp(probs), key.dtype)
+      probs_sum = tf.reduce_sum(probs, -1, True)
+    else:
+      probs = tf.cast(tf.nn.softmax(padded_logits), key.dtype)
+      probs_sum = None
 
-    unscaled_probs = py_utils.HasShape(unscaled_probs, [b, n, t, s])
-    return tf.cast(unscaled_probs, key.dtype), tf.cast(probs_sum, key.dtype)
+    probs = py_utils.HasShape(probs, [b, n, t, s])
+    return probs, probs_sum
 
   def _AttenContext(self, theta, probs, value):
     return tf.einsum('BNTS,BSNH->BTNH', probs, value)
@@ -441,20 +450,19 @@ class MultiHeadedAttention(base_layer.BaseLayer):
 
     # Compute prob with shape [batch, heads, target_time, source_time].
     with tf.name_scope('probs'):
-      unscaled_probs, probs_sum = self.AttenProbs(theta, query, key, paddings,
-                                                  segment_mask,
-                                                  per_step_padding)
+      probs, probs_sum = self.AttenProbs(theta, query, key, paddings,
+                                         segment_mask, per_step_padding)
       # Apply dropout to probs.
-      unscaled_probs = self.atten_dropout.FProp(theta.atten_dropout,
-                                                unscaled_probs)
+      probs = self.atten_dropout.FProp(theta.atten_dropout, probs)
 
     # Compute the attention context vector.
     with tf.name_scope('ctx'):
-      unscaled_encoded = self._AttenContext(theta, unscaled_probs, value)
-      # The 2nd part of the softamx --- scaling.
-      encoded = unscaled_encoded / tf.transpose(probs_sum, [0, 2, 1, 3])
+      encoded = self._AttenContext(theta, probs, value)
+      if p.enable_scaling_code_motion:
+        # The 2nd part of the softamx --- scaling.
+        encoded = encoded / tf.transpose(probs_sum, [0, 2, 1, 3])
 
-    return encoded, unscaled_probs
+    return encoded, probs
 
   def _DotAttenOneStep(self,
                        theta,
@@ -1283,11 +1291,62 @@ class LocalSelfAttention(MultiHeadedAttention):
                  cached_key_vec,
                  cached_value_vec,
                  paddings,
-                 segment_mask,
-                 per_step_padding,
-                 time_step,
+                 segment_mask=None,
+                 per_step_padding=None,
+                 time_step=None,
                  use_short_seq_opt=False):
-    raise NotImplementedError()
+    """Computes the value vector given the query of the current step.
+
+    This function is used by autoregressive decoding.
+
+    Note: When the context window size is much smaller than target sequence
+    length, to make it run more efficent, T below can be just the window size.
+    Then, time_step should be the relative decode step and not bigger than T.
+
+    Args:
+      theta: A `.NestedMap` object containing weights' values of this layer and
+        its children layers.
+      query_vec:        [B, 1, D].
+      cached_key_vec:   [T, B, N, H].
+      cached_value_vec: [T, B, N, H].
+      paddings:         [B, T], or None if there is no padding.
+      segment_mask:     [B, 1, T, S] or None. Not used right now.
+      per_step_padding: A mask used by decoder self-attention to prevent
+        information flow from future (causal padding). It has shape [B, 1, T] if
+        not None. Not used right now.
+      time_step: A scalar, the current decode step, 0-based.
+      use_short_seq_opt: A bool, whether using short sequence optimization. Not
+        supported right now.
+
+    Returns:
+      encoded:           [B, 1, D].
+      updated_key_vec:   [T, B, N, H].
+      updated_value_vec: [T, B, N, H].
+
+    Raises:
+      ValueError: If right_context is non-zero.
+      NotImplementedError: If use_short_seq_opt is true.
+    """
+    p = self.params
+    if p.right_context != 0:
+      raise ValueError(
+          'Right context must be zero for autoregressive decoding.')
+    if use_short_seq_opt:
+      raise NotImplementedError('use_short_seq_opt is not supported yet.')
+
+    # Make local casual paddings, which have shape [B, T].
+    t, b, _, _ = py_utils.GetShape(cached_key_vec, 4)
+    if paddings is None:
+      paddings = tf.zeros([b, t], dtype=query_vec.dtype)
+    position_diff = tf.tile(tf.range(t)[tf.newaxis, :], [b, 1]) - time_step
+    valid_atten = tf.math.logical_and(position_diff > -p.left_context,
+                                      position_diff <= 0)
+    local_causal_padding = 1.0 - tf.cast(valid_atten, dtype=query_vec.dtype)
+    paddings += local_causal_padding
+
+    return super().ExtendStep(theta, query_vec, cached_key_vec,
+                              cached_value_vec, paddings, segment_mask,
+                              per_step_padding, time_step, use_short_seq_opt)
 
   @classmethod
   def FPropMeta(cls, p, *args):

@@ -445,23 +445,21 @@ class BaseTask(base_layer.BaseLayer):
     with tf.name_scope('fprop'), tf.name_scope(p.name):
       # Always reset step seed at the start of a new global_step.
       py_utils.ResetStepSeed()
-      if py_utils.use_tpu():
-        metrics, per_example = self._FPropTpu(theta, input_batch)
-      else:
-        metrics, per_example = self._FPropSplitInputBatch(theta, input_batch)
+      metrics, per_example = self._FPropSplitInputBatch(theta, input_batch)
       self._FPropResult(metrics, per_example)
     return metrics, per_example
 
   def _FPropTpu(self, theta, input_batch):
-    p = self.params
-    with tf.name_scope('fprop'), tf.name_scope(p.name):
-      with tf.name_scope('tower_0_0'):
-        metrics, per_example = self.FPropTower(theta, input_batch)
-        metrics = py_utils.WeightedAvgOfMetrics([metrics])
+    with tf.name_scope('tower_0_0'):
+      metrics, per_example = self.FPropTower(theta, input_batch)
+      metrics = py_utils.WeightedAvgOfMetrics([metrics])
     return metrics, per_example
 
   def _FPropSplitInputBatch(self, theta, input_batch):
     """Splits the input batch on the input device."""
+    if py_utils.use_tpu():
+      return self._FPropTpu(theta, input_batch)
+
     cluster = self.cluster
     num_splits = cluster.num_splits_per_client
 
@@ -497,7 +495,6 @@ class BaseTask(base_layer.BaseLayer):
                 metrics, per_example = self.FPropTower(theta_local, batch)
           all_metrics.append(metrics)
           all_per_example_tensors.append(per_example)
-
     return py_utils.WeightedAvgOfMetrics(
         all_metrics), py_utils.ConcatPerExampleTensors(all_per_example_tensors)
 
@@ -519,14 +516,18 @@ class BaseTask(base_layer.BaseLayer):
     self._metrics = metrics
     summary_utils.scalar('num_predictions', self._num_predictions)
 
+  def GetInputBatch(self):
+    """Gets an input batch."""
+    if py_utils.use_tpu():
+      return self.input_generator.TpuDequeueBatch()
+    else:
+      return self.input_generator.SplitInputBatch(
+          self.cluster.num_splits_per_client)
+
   def FPropDefaultTheta(self, input_batch=None):
     """Calls `FProp` with this layer's parameters."""
     if input_batch is None:
-      if py_utils.use_tpu():
-        input_batch = self.input_generator.TpuDequeueBatch()
-      else:
-        input_batch = self.input_generator.SplitInputBatch(
-            self.cluster.num_splits_per_client)
+      input_batch = self.GetInputBatch()
     return self.FProp(self.theta, input_batch)
 
   def AdjustGradients(self, vars_gradients):
@@ -543,8 +544,10 @@ class BaseTask(base_layer.BaseLayer):
   def BProp(self):
     self._BPropForVariables(self.vars)
 
-  def _BPropForVariables(self, vmap):
-    """Constructs the backward graph."""
+  def _BPropGenTrainOps(self, vmap, metrics=None, add_summary=True):
+    """Populates the train_ops dictionary in a backwards pass."""
+    metrics = metrics or self._metrics
+
     bprop_variable_filters = self.input_generator.GetBpropVariableFilters()
     # Only compute the mask if the variable filters are not empty.
     if bprop_variable_filters != [''] * len(bprop_variable_filters):
@@ -562,10 +565,10 @@ class BaseTask(base_layer.BaseLayer):
     for optimization in self.learners:
       learner_name = optimization.params.name
       loss_name = optimization.params.loss_name or learner_name
-      metric = self._metrics.get(loss_name, None)
+      metric = metrics.get(loss_name, None)
       if metric is None:
         raise ValueError('Loss %s not found in metrics %s' %
-                         (loss_name, list(self._metrics.keys())))
+                         (loss_name, list(metrics.keys())))
       loss = metric[0]
       all_losses.append(loss)
       train_ops['train/%s' % learner_name], eval_metrics = optimization.Apply(
@@ -573,17 +576,23 @@ class BaseTask(base_layer.BaseLayer):
           vmap,
           gradient_mask=gradient_mask,
           gradient_adjuster=self.AdjustGradients)
-      for key, (value, weight) in eval_metrics.items():
-        self.AddEvalMetric(key + '/' + learner_name, value, weight)
+      if add_summary:
+        for key, (value, weight) in eval_metrics.items():
+          self.AddEvalMetric(key + '/' + learner_name, value, weight)
 
     relevant_bn_updates, _ = py_utils.FindRelevantBatchNormUpdates(
         all_losses, tf.get_collection(py_utils.BATCH_NORM_UPDATES))
     train_ops['bn_updates'] = relevant_bn_updates
 
+    var_update_ops = [
+        tf.group(*tf.nest.flatten(train_ops), name='var_update_ops')
+    ]
     # Post training step update.
-    train_ops['post_step'] = self.PostTrainingStepUpdate(self.global_step)
+    with tf.control_dependencies(var_update_ops):
+      post_step_op = self.PostTrainingStepUpdate(self.global_step)
 
-    with tf.control_dependencies(tf.nest.flatten(train_ops)):
+    train_ops = {}
+    with tf.control_dependencies([post_step_op]):
       # Get the op to update the weight masks and thresholds
       mask_update_op = self._GetMaskUpdateOp()
       train_ops['mask_updates'] = mask_update_op
@@ -610,6 +619,11 @@ class BaseTask(base_layer.BaseLayer):
 
     for op_name, op in train_ops.items():
       assert op is not None, op_name
+    return train_ops
+
+  def _BPropForVariables(self, vmap):
+    """Constructs the backward graph."""
+    train_ops = self._BPropGenTrainOps(vmap)
 
     # TODO(rpang): try to structure _train_op as:
     #   tf.cond(skip_step, <only update skip stats>, <all updates>)
@@ -834,156 +848,6 @@ class BaseTask(base_layer.BaseLayer):
         pruning_obj.add_pruning_summaries()
       mask_update_op = pruning_obj.conditional_mask_update_op()
     return mask_update_op
-
-
-class DistillationTask(BaseTask):
-  """A task to distill knowledge from a teacher task to a student task.
-
-  The training parameters (e.g., learning rate) are determined only by
-  `DistillationTask.params.train`. Teacher and student task's training and eval
-  parameters must be set to None.
-  """
-
-  @classmethod
-  def Params(cls):
-    p = super().Params()
-    p.Define('teacher', None, 'The teacher task params.')
-    p.Define('student', None, 'The student task params.')
-    p.Define(
-        'distillation_loss_weight',
-        # Only uses distillation loss by default.
-        schedule.ConstantOne.Params(),
-        'A schedule of distillation loss weight. '
-        'The weight determines the fraction of total loss contributed by '
-        'distillation loss, while the rest loss will be computed against '
-        'the ground truth. '
-        'A weight of 0 means to only use ground-truth and ignore teacher '
-        'predictions, while a weight 1 means to only use teacher '
-        'predictions and ignore ground truth. '
-        'The weight is specified as a schedule to allow it to change '
-        'during training.')
-    p.Define(
-        'teacher_target_type', 'truth', 'The target type for the teacher. '
-        'Choices are: '
-        ' "truth": using the ground-truth target labels '
-        ' "beam": using the 1-best hypothesis from the beam search.')
-    p.Define(
-        'beam_search_temperature', 1.0, 'The temperature to scale the'
-        'log-prob of each beam search hypothesis. This is used in '
-        'training only')
-    p.Define(
-        'train_teacher', False, 'Adds the teacher\'s loss (w.r.t the ground '
-        'truth labels) to the overall ground truth loss. This can be used for '
-        'instance when the teacher is trained in parallel to the student.')
-    return p
-
-  def __init__(self, params):
-    assert issubclass(params.cls, DistillationTask)
-    super().__init__(params)
-
-    p = self.params
-    # While student does not need its own input generator for training, it
-    # needs an input generator for inference graphs.
-    p.student.input = p.input
-    # Teacher also might need an input generator, eg. for waveform_processor.
-    p.teacher.input = p.input
-    for child in ('teacher', 'student'):
-      child_p = getattr(p, child)
-      assert issubclass(child_p.cls, BaseTask)
-      assert child_p.train is None
-      assert child_p.eval is None
-      # In theory it's ok for teacher to be a DistillationTask. In practice
-      # it probably won't happen.
-      assert not issubclass(child_p.cls, DistillationTask)
-      child_p.name = child
-      self.CreateChild(child, child_p)
-    self.CreateChild('distillation_loss_weight', p.distillation_loss_weight)
-
-  def ComputePredictions(self, theta, input_batch):
-    p = self.params
-    with tf.name_scope(p.name):
-      if p.teacher_target_type == 'truth':
-        teacher_predictions = self.teacher.ComputePredictions(
-            theta.teacher, input_batch)
-        student_predictions = self.student.ComputePredictions(
-            theta.student, input_batch)
-        return py_utils.NestedMap(
-            teacher=teacher_predictions, student=student_predictions)
-      elif p.teacher_target_type == 'beam':
-        (teacher_predictions, teacher_input_batch,
-         teacher_beam_prob) = self.teacher.ComputeBeamPredictions(
-             theta.teacher, input_batch, p.beam_search_temperature)
-        # We use 'teacher_input_batch' instead of 'input_batch' for 'student'
-        # because the training of student network uses target transcripts for
-        # the "teacher forcing" mode and here the target transcripts should come
-        # from the teacher's beam search.
-        student_predictions = self.student.ComputePredictions(
-            theta.student, teacher_input_batch)
-        return py_utils.NestedMap(
-            teacher=teacher_predictions,
-            student=student_predictions,
-            teacher_beam_prob=teacher_beam_prob)
-      else:
-        raise ValueError('teacher target type not defined properly: %s' %
-                         self.p.teacher_target_type)
-
-  def ComputeLoss(self, theta, predictions, input_batch):
-    p = self.params
-    per_example = {}
-    with tf.name_scope('groundtruth_loss'):
-      student_groundtruth_loss, student_groundtruth_per_example = (
-          self.student.ComputeLoss(theta.student, predictions.student,
-                                   input_batch))
-      groundtruth_loss = student_groundtruth_loss
-      groundtruth_loss['student_groundtruth_loss'] = (
-          student_groundtruth_loss['loss'])
-      per_example.update(student_groundtruth_per_example)
-
-      if p.train_teacher:
-        teacher_groundtruth_loss, _ = self.teacher.ComputeLoss(
-            theta.teacher, predictions.teacher, input_batch)
-        groundtruth_loss['teacher_groundtruth_loss'] = (
-            teacher_groundtruth_loss['loss'])
-        # The new loss is the wighted sum of the teacher and student losses.
-        groundtruth_loss['loss'] = py_utils.WeightedAvg(*zip(
-            teacher_groundtruth_loss['loss'], student_groundtruth_loss['loss']))
-
-    with tf.name_scope('distillation_loss'):
-      distillation_loss, distill_per_example = self.ComputeDistillationLoss(
-          theta, predictions, input_batch)
-      distillation_loss['distillation_loss'] = distillation_loss['loss']
-      per_example.update(distill_per_example)
-
-    distillation_loss_weight = self.distillation_loss_weight.FProp(
-        theta.distillation_loss_weight, self.global_step)
-    metrics = py_utils.CombineMetrics([
-        (groundtruth_loss, 1 - distillation_loss_weight),
-        (distillation_loss, distillation_loss_weight),
-    ])
-    return metrics, per_example
-
-  def ComputeDistillationLoss(self, theta, predictions, input_batch):
-    raise NotImplementedError('Abstract method')
-
-  def BProp(self):
-    p = self.params
-    if p.train_teacher:
-      return super().BProp()
-    else:
-      # Only bprop on student variables.
-      self._BPropForVariables(self.student.vars)
-
-  def Decode(self, input_batch):
-    return self.student.Decode(input_batch)
-
-  def Inference(self):
-    return self.student.Inference()
-
-  def CreateDecoderMetrics(self):
-    return self.student.CreateDecoderMetrics()
-
-  def PostProcessDecodeOut(self, dec_out_dict, dec_metrics_dict):
-    return self.student.PostProcessDecodeOut(dec_out_dict, dec_metrics_dict)
 
 
 class BaseModel(base_layer.BaseLayer):

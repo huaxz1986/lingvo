@@ -77,6 +77,11 @@ tf.flags.DEFINE_bool(
     'or consumed by TPU')
 
 tf.flags.DEFINE_bool(
+    'tflite_compatible', False,
+    'Uses tflite converter-friendly ops at applicable places. This so far '
+    '(08/2020) is a only best-effort option.')
+
+tf.flags.DEFINE_bool(
     'pin_vars_to_cpu', False,
     'Pin variables to cpu:0.  This is useful for weight-sharing / multi-core '
     'inference on TPUs in which TPU core variables are managed via '
@@ -617,6 +622,21 @@ def GetSize(tensor):
   return np.prod(shape)
 
 
+def CausalSelfAttenPadding(seqlen, dtype):
+  """Wraps tf.linalg.band_part() for tflite compatibility."""
+  if FLAGS.tflite_compatible:
+    # [N, 1]
+    rows = tf.expand_dims(tf.range(seqlen), -1)
+    # [1, N]
+    cols = tf.expand_dims(tf.range(seqlen), 0)
+    row_cols = rows - cols
+    return tf.where(row_cols < 0, tf.ones([seqlen, seqlen], dtype),
+                    tf.zeros([seqlen, seqlen], tf.float32))
+  else:
+    return 1.0 - tf.linalg.band_part(
+        tf.ones([seqlen, seqlen], dtype=dtype), -1, 0)
+
+
 def use_xla():  # pylint: disable=invalid-name
   res = _FromGlobal('xla_device')
   if res:
@@ -1047,6 +1067,10 @@ class NestedMap(dict):
   def Transform(self, fn):
     """Returns a copy of this `.NestedMap` with fn applied on each value."""
     return self._RecursiveMap(lambda _, v: fn(v))
+
+  def TransformWithKey(self, fn):
+    """Returns a copy of this `.NestedMap` with fn applied on each key/value."""
+    return self._RecursiveMap(fn)
 
   def IsCompatible(self, other):
     """Returns true if self and other are compatible.
@@ -2068,6 +2092,9 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
       in the model which should not be overridden, even if they match those in
       the loading rules.
 
+  Returns:
+    A list of overwritten variables.
+
   Raises:
     ValueError: if colliding vars exist or loading rules is not a list.
   """
@@ -2075,6 +2102,7 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
     tf.logging.info('Overriding vars from multiple checkpoints.')
 
   var_refs_overridden = set()
+  var_names_overridden = set()
   for ckpt_path, loading_rules in ckpts_loading_rules.items():
     tf.logging.info('Overriding vars from checkpoint: %s', ckpt_path)
 
@@ -2091,6 +2119,10 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
         var[1].experimental_ref()
         for var in _GetVarsToLoad(all_vars, loading_rules[0], loading_rules[1])
     ]
+    var_names_to_override = [
+        var[1].name
+        for var in _GetVarsToLoad(all_vars, loading_rules[0], loading_rules[1])
+    ]
 
     overlap_refs = set.intersection(var_refs_overridden, var_refs_to_override)
     if overlap_refs:
@@ -2099,7 +2131,9 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
     OverrideVarsFromCheckpoint(session, all_vars, ckpt_path, loading_rules[0],
                                loading_rules[1])
     var_refs_overridden.update(var_refs_to_override)
+    var_names_overridden.update(var_names_to_override)
   tf.logging.info('Model variables overridden: %s', var_refs_overridden)
+  return var_names_overridden
 
 
 def ComputeGradientsSimple(loss, all_vars, grad_aggregation_method,

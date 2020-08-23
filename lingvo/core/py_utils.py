@@ -3932,7 +3932,7 @@ def StatefulRandomOpsInDefun(func, graph=None):
   Otherwise, these ops produce inconsistent values between FProp and BProp.
 
   Args:
-    func: a _DefinedFunction to check.
+    func: a _DefinedFunction or ConcreteFunction to check.
     graph: a Graph. Set None to use the default graph.
 
   Returns:
@@ -3941,10 +3941,6 @@ def StatefulRandomOpsInDefun(func, graph=None):
   Raises:
     InvalidArgumentError: if the input func/graph is invalid.
   """
-  if not isinstance(func, function._DefinedFunction):  # pylint: disable=protected-access
-    raise tf.errors.InvalidArgumentError(None, None,
-                                         'func is not a _DefinedFunction.')
-
   if graph is None:
     graph = tf.get_default_graph()
   func.add_to_graph(graph)
@@ -3953,15 +3949,18 @@ def StatefulRandomOpsInDefun(func, graph=None):
   # A dict from function name to FunctionDef.
   func_defs = {x.signature.name: x for x in graph_def.library.function}
 
-  if func.definition.signature.name not in func_defs:
-    raise tf.errors.InvalidArgumentError(
-        None, None,
-        'Defun {} is not in the graph .'.format(func.definition.signature.name))
+  if isinstance(func, function._DefinedFunction):  # pylint: disable=protected-access
+    if func.definition.signature.name not in func_defs:
+      raise tf.errors.InvalidArgumentError(
+          None, None, 'Defun {} is not in the graph .'.format(
+              func.definition.signature.name))
+    nodes = py_collections.deque(func.definition.node_def)
+  else:
+    nodes = py_collections.deque(func.function_def.node_def)
 
   stateful_ops = []
 
   # Recursively search for stateful random op.
-  nodes = py_collections.deque(func.definition.node_def)
   while nodes:
     node = nodes.pop()
     assert isinstance(node, node_def_pb2.NodeDef), node
@@ -3984,7 +3983,9 @@ def StatefulRandomOpsInDefun(func, graph=None):
     elif node.op == 'If':
       _AddDefunNodes(node.attr['then_branch'].func.name)
       _AddDefunNodes(node.attr['else_branch'].func.name)
-    else:
+    elif node.op == 'StatefulPartitionedCall':
+      _AddDefunNodes(node.attr['f'].func.name)
+    elif node.op != 'PartitionedCall':
       # For other op, check whether itself is a Defun op.
       _AddDefunNodes(node.op)
 
@@ -4283,12 +4284,12 @@ def _AssertInputsMatch(op, args, implicit_captures):
     raise ValueError(('Too many inputs. The most likely cause is that fwd '
                       'captures additional tensors: extra inputs %r vs %r '
                       'captures=%r') % (list(op.inputs), list(expected_inputs),
-                                        list(implicit_captures.Flatten())))
+                                        list(Flatten(implicit_captures))))
   if len(op.inputs) < expected_num_inputs:
     raise ValueError(('Mismatched inputs to fwd: Found %d vs expected %d: %r'
                       '. Implicit captures(%d) = %r') %
                      (len(op.inputs), expected_num_inputs, list(op.inputs),
-                      len(implicit_captures.Flatten()), implicit_captures))
+                      len(Flatten(implicit_captures)), implicit_captures))
 
 
 def _TensorSpecs(nmap):
@@ -4296,16 +4297,10 @@ def _TensorSpecs(nmap):
   return Transform(lambda t: tf.TensorSpec(t.shape, t.dtype), nmap)
 
 
-def _GetConcreteFunction(func, inputs):
-  """Returns a ConcreteFunction with specific input signature."""
-  return func.get_concrete_function(*Flatten(_TensorSpecs(inputs)))
-
-
 def _DefineDefun(fwd,
                  fwd_sig,
                  bak=None,
                  bak_as_function=False,
-                 implicit_captures=None,
                  device=None):
   """Wraps fwd in a defun with custom gradient bak.
 
@@ -4313,12 +4308,11 @@ def _DefineDefun(fwd,
     fwd: A callable xs: Nested Structure -> ys: Nested Structure.
     fwd_sig: A Nested Structure of tf.Tensor representing the input signature of
       fwd.
-    bak: A callable xs, ys, dys: Nested Structure -> dxs: Nested Structure. The
-      custom backprop function for fwd. If implicit_captures is not None, bak
-      must return its gradients in a Nested Structure as the last part of dxs.
+    bak: A callable xs, ys, dys: Nested Structure -> dxs[, dcapture]: Nested
+      Structure. The custom backprop function for fwd. bak needs to return
+      dcapture if fwd uses any implicitly captured tensors, whose gradients are
+      dcapture.
     bak_as_function: Whether to create a TF graph function for bak.
-    implicit_captures: A Nested Structure of tf.Tensor. Implicit inputs of fwd
-      that are not listed in fwd_sig.
     device: the device on which to run fwd and bak.
 
   Returns:
@@ -4342,9 +4336,8 @@ def _DefineDefun(fwd,
   sigs = NestedMap()
 
   python_grad_func = None
+  implicit_captures = NestedMap()  # Will be set after Forward is defined.
   if bak:
-    if implicit_captures is None:
-      implicit_captures = NestedMap()
 
     def Grad(op, *args):
       """Gradient function for the forward function.
@@ -4379,6 +4372,10 @@ def _DefineDefun(fwd,
     sigs.ret_shapes = Transform(get_shape, rets)
     return Flatten(rets)
 
+  # Invokes fwd() to get sigs.ret_dtypes and sigs.ret_shapes.
+  Forward.add_to_graph(tf.get_default_graph())
+  implicit_captures.captured = Forward.captured_inputs
+
   if bak:
 
     def Backward(*args):
@@ -4402,9 +4399,6 @@ def _DefineDefun(fwd,
       return Flatten(dxs)
 
     if bak_as_function:
-      # Invokes fwd() to get sigs.ret_dtypes and sigs.ret_shapes.
-      Forward.add_to_graph(tf.get_default_graph())
-
       sigs.backward = tf.Defun(
           *Flatten([arg_dtypes, sigs.ret_dtypes, sigs.ret_dtypes]),
           noinline=noinline)(
@@ -4456,11 +4450,42 @@ def _ApplySharedRendezvous(func):
   # pylint: enable=protected-access
 
 
+def _WrapFunction(func=None, input_signature=None):
+  """Wraps func as a tf.function to be used in If/WhileLoop/CallDefun."""
+  if input_signature is None:
+    input_signature = []
+
+  def Decorated(fn):
+
+    @tf.function(input_signature=input_signature, autograph=False)
+    def Fn(*args):
+      # TODO(b/163904067): mimic Defun' behavior and reset the step seed to
+      # avoid it being used as an implicit capture. This is not a desired
+      # behavir, it should take the step seed from parent graph instead.
+      ResetStepSeed()
+      return fn(*args)
+
+    _ApplySharedRendezvous(Fn)
+
+    # Add the function to the graph so it'll be traced under the current
+    # context. This is necessary if the function body captures any non-tensor
+    # values from the environment, like symbolic maps.
+    cf = Fn.get_concrete_function()
+    cf.add_to_graph()
+    return cf
+
+  # For the `foo = _WrapFunction(foo, ...)` use case.
+  if func is not None:
+    return Decorated(func)
+
+  # For the `@_WrapFunction(...)` use case.
+  return Decorated
+
+
 def _DefineFunction(fwd,
                     fwd_sig,
                     bak=None,
                     bak_as_function=False,
-                    implicit_captures=None,
                     device=None):
   """Wraps fwd in a defun with custom gradient bak.
 
@@ -4468,12 +4493,11 @@ def _DefineFunction(fwd,
     fwd: A callable xs: Nested Structure -> ys: Nested Structure.
     fwd_sig: A Nested Structure of tf.Tensor representing the input signature of
       fwd.
-    bak: A callable xs, ys, dys: Nested Structure -> dxs: Nested Structure. The
-      custom backprop function for fwd. If implicit_captures is not None, bak
-      must return its gradients in a Nested Structure as the last part of dxs.
+    bak: A callable xs, ys, dys: Nested Structure -> dxs[, dcapture]: Nested
+      Structure. The custom backprop function for fwd. bak needs to return
+      dcapture if fwd uses any implicitly captured tensors, whose gradients are
+      dcapture.
     bak_as_function: Whether to create a TF graph function for bak.
-    implicit_captures: A Nested Structure of tf.Tensor. Implicit inputs of fwd
-      that are not listed in fwd_sig.
     device: the device on which to run fwd and bak.
 
   Returns:
@@ -4481,50 +4505,32 @@ def _DefineFunction(fwd,
   """
   assert fwd is not None
   noinline = not use_xla()
-
-  fwd_sig_no_captures = _TensorSpecs(fwd_sig)
-  if implicit_captures:
-    # With custom_gradient, implicit captures need to be part of the input.
-    fwd_sig = [fwd_sig_no_captures, _TensorSpecs(implicit_captures)]
-  else:
-    fwd_sig = fwd_sig_no_captures
-    implicit_captures = NestedMap()
+  fwd_sig = _TensorSpecs(fwd_sig)
 
   # Only used to hold the output signature of fwd in sigs.rets, which will be
   # set in Forward.
   sigs = NestedMap()
 
-  @tf.function(input_signature=Flatten(fwd_sig), autograph=False)
+  @_WrapFunction(input_signature=Flatten(fwd_sig))
   def Forward(*args):
     """The forward function."""
-    # TODO(b/163904067): mimic Defun' behavior and reset the step seed to
-    # avoid it being used as an implicit capture. It should take the step seed
-    # from parent graph instead.
-    ResetStepSeed()
     with RemoveAssertContext(remove=noinline), tf.device(device):
       xs = Pack(fwd_sig, args)
-      if implicit_captures:
-        xs, _ = xs  # Ignore implicit captures since fwd doesn't take that.
       rets = fwd(xs)
     sigs.rets = _TensorSpecs(rets)
     return Flatten(rets)
 
   shared_rendezvous = _GetSharedRendezvous()
-  _ApplySharedRendezvous(Forward)
-  forward_cf = Forward.get_concrete_function()
-  forward_cf.add_to_graph()
+  implicit_captures = Forward.captured_inputs
 
-  if bak:
+  if not bak:
+    forward = Forward
+  else:
 
     def Backward(*args):
-      if bak_as_function:
-        # TODO(b/163904067): mimic Defun' behavior and reset the step seed to
-        # avoid it being used as an implicit capture. It should take the step
-        # seed from parent graph instead.
-        ResetStepSeed()
-      xs_len = len(Flatten(fwd_sig_no_captures))
+      xs_len = len(Flatten(fwd_sig))
       ys_len = len(Flatten(sigs.rets))
-      xs = Pack(fwd_sig_no_captures, args[:xs_len])
+      xs = Pack(fwd_sig, args[:xs_len])
       ys = Pack(sigs.rets, args[xs_len:(xs_len + ys_len)])
       dys = Pack(sigs.rets, args[xs_len + ys_len:])
       with RemoveAssertContext(remove=noinline), tf.device(device):
@@ -4532,16 +4538,8 @@ def _DefineFunction(fwd,
       return Flatten(dxs)
 
     if bak_as_function:
-      backward = tf.function(
-          Backward,
-          input_signature=Flatten([fwd_sig_no_captures, sigs.rets, sigs.rets]),
-          autograph=False)
-      _ApplySharedRendezvous(backward)
-      # Add the backward function to graph so it's invoked under the same
-      # context as forward. This is necessary if the function body captures any
-      # non-tensor values from the environment, like symbolic maps.
-      backward_cf = backward.get_concrete_function()
-      backward_cf.add_to_graph()
+      backward_cf = _WrapFunction(
+          Backward, input_signature=Flatten([fwd_sig, sigs.rets, sigs.rets]))
     else:
 
       def BackwardWithSharedRendezvous(*args):
@@ -4553,7 +4551,14 @@ def _DefineFunction(fwd,
     @tf.custom_gradient
     def ForwardWithGrad(*args):
       """Forward function and its custom gradient."""
-      op = NestedMap(inputs=args, outputs=forward_cf(*args))
+      # Note that `args` includes implicit_captures. This is required by
+      # tf.custom_gradient so that when the Grad() outputs include gradients to
+      # implicit captures, they match the inputs to ForwardWithGrad().
+      #
+      # However, Forward doesn't take implicit_captures as input, so we exclude
+      # them here.
+      fwd_args = args[:(len(args) - len(Flatten(implicit_captures)))]
+      op = NestedMap(inputs=args, outputs=Forward(*fwd_args))
 
       def Grad(*args, **kwargs):
         """Gradient function for the forward function.
@@ -4570,27 +4575,21 @@ def _DefineFunction(fwd,
               'Ignoring additional arguments used by tf.custom_gradient: %s',
               str(kwargs))
 
-        # With tf.custom_gradient, implicit captures are always part of fwd's
-        # input signature.
-        _AssertInputsMatch(op, fwd_sig, NestedMap())
+        _AssertInputsMatch(op, fwd_sig, implicit_captures)
 
         # Ensure dys contains no None.
         args = ConvertNoneGradientToZeros(list(op.outputs), list(args))
 
-        xs = Pack(fwd_sig, op.inputs)
-        if implicit_captures:
-          xs, _ = xs  # Ignore implicit captures since bak doesn't take that.
+        xs, _ = Pack([fwd_sig, implicit_captures], op.inputs)
         return backward_cf(*Flatten([xs, op.outputs, args]))
 
       return op.outputs, Grad
 
-    forward = ForwardWithGrad
-  else:
-    forward = Forward
+    forward = lambda *args: ForwardWithGrad(*Flatten([args, implicit_captures]))
 
   def Call(args):
     """Wrapper of fwd."""
-    flat_rets = forward(*Flatten([args, implicit_captures]))
+    flat_rets = forward(*Flatten(args))
     if not isinstance(flat_rets, (tuple, list)):
       flat_rets = [flat_rets]
     return Pack(sigs.rets, flat_rets)
@@ -4602,18 +4601,17 @@ def CallDefun(fwd,
               args,
               bak=None,
               bak_as_function=False,
-              implicit_captures=None,
               device=None):
   """Wraps fwd in a defun with custom gradient bak and calls it with args.
 
   Args:
     fwd: A callable xs: Nested Structure -> ys: Nested Structure.
     args: A Nested Structure of tf.Tensor.
-    bak: A callable xs, ys, dys: Nested Structure -> dxs: Nested Structure. The
-      custom backprop function for fwd.
+    bak: A callable xs, ys, dys: Nested Structure -> dxs[, dcapture]: Nested
+      Structure. The custom backprop function for fwd. bak needs to return
+      dcapture if fwd uses any implicitly captured tensors, whose gradients are
+      dcapture.
     bak_as_function: Whether to create a TF graph function for bak.
-    implicit_captures: A Nested Structure of tf.Tensor. Implicit inputs of fwd
-      that are not listed in args.
     device: the device on which to run fwd and bak.
 
   Returns:
@@ -4623,7 +4621,7 @@ def CallDefun(fwd,
     fn = _DefineFunction
   else:
     fn = _DefineDefun
-  call = fn(fwd, args, bak, bak_as_function, implicit_captures, device)
+  call = fn(fwd, args, bak, bak_as_function, device)
   return call(args)
 
 
@@ -4647,35 +4645,25 @@ def If(cond, inputs, then_branch, else_branch):
 
   if _FromGlobal('if_use_tf_function'):
 
-    @tf.function(autograph=False)
+    @_WrapFunction(input_signature=Flatten(_TensorSpecs(inputs)))
     def ThenBranch(*args):
-      # TODO(b/163904067): mimic Defun' behavior and reset the step seed to
-      # avoid it being used as an implicit capture. It should take the step seed
-      # from parent graph instead.
-      ResetStepSeed()
       inp = Pack(inputs, args)
       out = then_branch(inp)
       ret_dtypes.then_out = Transform(get_dtype, out)
       return Flatten(out)
 
-    @tf.function(autograph=False)
+    @_WrapFunction(input_signature=Flatten(_TensorSpecs(inputs)))
     def ElseBranch(*args):
-      # TODO(b/163904067): mimic Defun' behavior and reset the step seed to
-      # avoid it being used as an implicit capture. It should take the step seed
-      # from parent graph instead.
-      ResetStepSeed()
       inp = Pack(inputs, args)
       out = else_branch(inp)
       ret_dtypes.else_out = Transform(get_dtype, out)
       return Flatten(out)
 
-    _ApplySharedRendezvous(ThenBranch)
-    _ApplySharedRendezvous(ElseBranch)
     ret = tf.If(
         cond=cond,
         inputs=Flatten(inputs),
-        then_branch=_GetConcreteFunction(ThenBranch, inputs),
-        else_branch=_GetConcreteFunction(ElseBranch, inputs))
+        then_branch=ThenBranch,
+        else_branch=ElseBranch)
   else:
     dtypes = Flatten(Transform(lambda x: x.dtype, inputs))
 
@@ -4729,31 +4717,18 @@ def WhileLoop(cond, body, loop_state):
 
   if _FromGlobal('while_loop_use_tf_function'):
 
-    @tf.function(autograph=False)
+    @_WrapFunction(input_signature=Flatten(_TensorSpecs(state)))
     def LoopCond(*args):
-      # TODO(b/163904067): mimic Defun' behavior and reset the step seed to
-      # avoid it being used as an implicit capture. It should take the step seed
-      # from parent graph instead.
-      ResetStepSeed()
       s = state.Pack(args)
       return cond(s.loop_state)
 
-    @tf.function(autograph=False)
+    @_WrapFunction(input_signature=Flatten(_TensorSpecs(state)))
     def LoopBody(*args):
-      # TODO(b/163904067): mimic Defun' behavior and reset the step seed to
-      # avoid it being used as an implicit capture. It should take the step seed
-      # from parent graph instead.
-      ResetStepSeed()
       s = state.Pack(args)
       s.loop_state = body(s.loop_state)
       return s.Flatten()
 
-    _ApplySharedRendezvous(LoopCond)
-    _ApplySharedRendezvous(LoopBody)
-    new_state = tf.While(
-        input_=state.Flatten(),
-        cond=_GetConcreteFunction(LoopCond, state),
-        body=_GetConcreteFunction(LoopBody, state))
+    new_state = tf.While(input_=state.Flatten(), cond=LoopCond, body=LoopBody)
   else:
     dtypes = state.Transform(lambda x: x.dtype).Flatten()
 

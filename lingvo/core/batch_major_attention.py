@@ -1479,7 +1479,6 @@ class RoutingAttention(MultiHeadedAttention):
   dot product.
 
   TODO(zhouwk) This class is WIP, what remains to be done:
-    * self-attention (causal masked or not)
     * single step during decoding
     * propagate clustering loss;
     * supporting packed inputs;
@@ -1571,17 +1570,23 @@ class RoutingAttention(MultiHeadedAttention):
       atten_probs: [B, T, N, S].
     """
     p = self.params
+    is_self_attention = (query is key)
     # Whether to update the centroids. Only do this during training.
     update = not self.do_eval
 
     query = attention_util.KMeansClusteringForAtten.LayerNorm(query)
-    key = attention_util.KMeansClusteringForAtten.LayerNorm(key)
     # [B, T, N, K]
     q_dists, _ = self.clustering.FProp(
         theta.clustering, query, query_paddings, update=update)
-    # [B, S, N, K]
-    k_dists, _ = self.clustering.FProp(
-        theta.clustering, key, key_paddings, update=update)
+
+    if is_self_attention:
+      key = query
+      k_dists = q_dists
+    else:
+      key = attention_util.KMeansClusteringForAtten.LayerNorm(key)
+      # [B, S, N, K]
+      k_dists, _ = self.clustering.FProp(
+          theta.clustering, key, key_paddings, update=update)
     if p.fast_path:
       return self._DotAttenFastPath(theta, query, key, value, q_dists, k_dists,
                                     query_paddings, key_paddings)
@@ -2890,9 +2895,13 @@ class TransformerFeedForwardLayerWithTaskId(
     return h
 
 
-# TODO(ankurbpn,huangyp): Remove redundant segment mask calculations.
+# TODO(ankurbpn,huangyp): Remove this layer.
 class GPipeTransformerLayer(TransformerLayer):
-  """GPipe compatible transformer layer."""
+  """GPipe compatible transformer layer.
+
+  DEPRECATED: This layer and its use in GPipeTransformerStack is
+  deprecated. Consider using the new GPipeBatchMajorTransformerStack instead.
+  """
 
   @classmethod
   def Params(cls):
@@ -3022,6 +3031,150 @@ class GPipeTransformerLayer(TransformerLayer):
     cur_output = self.fflayer.FProp(
         theta.fflayer, atten_vec,
         tf.zeros([target_batch, 1], dtype=atten_vec.dtype), task_id)
+    return cur_output, updated_states
+
+
+class GPipeBatchMajorTransformerLayer(TransformerLayer):
+  """GPipe compatible batch majortransformer layer.
+
+  To be used with the new GPipeBatchMajorStack.
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super().Params()
+    p.Define('ln_tpl', layers.LayerNorm.Params(),
+             'Layer norm default params. No layernorm if set to None.')
+    p.Define('output_layer_norm', False,
+             'Whether to layer normalize the output of the layer.')
+    return p
+
+  def __init__(self, params):
+    # Initialize output layer norm.
+    super().__init__(params)
+    p = self.params
+    if p.output_layer_norm:
+      params = p.ln_tpl.Copy()
+      params.name = 'output_ln'
+      params.input_dim = p.input_dim
+      self.CreateChild('layer_norm', params)
+
+  def FProp(self, theta, source_vecs, source_paddings, target_vecs,
+            target_paddings, encoder_self_atten_segment_mask,
+            decoder_self_atten_segment_mask, decoder_cross_atten_segment_mask):
+    p = self.params
+    with tf.name_scope(p.name):
+      if p.has_aux_atten:  # Decoder FProp
+        atten_vec, _ = self.self_atten.FProp(
+            theta.self_atten,
+            target_vecs,
+            None,
+            target_paddings,
+            segment_mask=decoder_self_atten_segment_mask)
+        atten_vec, _ = self.cross_atten.FProp(
+            theta.cross_atten,
+            atten_vec,
+            source_vecs,
+            source_paddings,
+            segment_mask=decoder_cross_atten_segment_mask)
+        atten_vec = self.fflayer.FProp(theta.fflayer, atten_vec,
+                                       target_paddings)
+        atten_vec.set_shape(target_vecs.shape)
+        if p.output_layer_norm:
+          atten_vec = self.layer_norm.FProp(theta.layer_norm, atten_vec)
+        return (source_vecs, source_paddings, atten_vec, target_paddings,
+                encoder_self_atten_segment_mask,
+                decoder_self_atten_segment_mask,
+                decoder_cross_atten_segment_mask)
+
+      # Encoder FProp
+      atten_vec, _ = self.self_atten.FProp(
+          theta.self_atten,
+          source_vecs,
+          None,
+          source_paddings,
+          segment_mask=encoder_self_atten_segment_mask)
+      atten_vec = self.fflayer.FProp(theta.fflayer, atten_vec, source_paddings)
+      atten_vec.set_shape(source_vecs.shape)
+      if p.output_layer_norm:
+        atten_vec = self.layer_norm.FProp(theta.layer_norm, atten_vec)
+
+      return (atten_vec, source_paddings, target_vecs, target_paddings,
+              encoder_self_atten_segment_mask, decoder_self_atten_segment_mask,
+              decoder_cross_atten_segment_mask)
+
+  @classmethod
+  def FPropMeta(cls, p, inputs, *args):
+    py_utils.CheckShapes((inputs,))
+    flops_per_element = 5
+    source_batch, src_time, dim = inputs
+    flops = flops_per_element * src_time * src_time * source_batch * dim
+    args = args if isinstance(args, tuple) else (args,)
+    return py_utils.NestedMap(flops=flops, out_shapes=(inputs,) + args)
+
+  @classmethod
+  def SetupDeterministicDropout(cls, params):
+    """Replaced dropout layers in transformer with deterministic ones."""
+    params.tr_atten_tpl.dropout_tpl = (
+        layers.DeterministicDropoutLayer.Params())
+    params.tr_atten_tpl.atten_tpl.dropout_tpl = (
+        layers.DeterministicDropoutLayer.Params())
+    params.tr_fflayer_tpl.residual_dropout_tpl = (
+        layers.DeterministicDropoutLayer.Params())
+    params.tr_fflayer_tpl.fflayer_tpl.dropout = (
+        layers.DeterministicDropoutLayer.Params())
+    return params
+
+  def ExtendStep(self,
+                 theta,
+                 query_vec,
+                 aux_vec,
+                 aux_paddings,
+                 cached_states,
+                 time_step,
+                 use_short_seq_opt=False):
+    """Transformer decoder layer, extend one step in autoregressive decoding.
+
+    Args:
+      theta: A `.NestedMap` object containing weights' values of this layer and
+        its children layers.
+      query_vec:    [target_batch, 1, dim].
+      aux_vec:      [source_batch, source_time, dim]
+      aux_paddings: [source_batch, source_time]
+      cached_states: A `.NestedMap` object containing tensors which are the
+        results of previous attentions, used for fast decoding. key   -
+        [target_time, target_batch, num_heads, dim_per_head]. value -
+        [target_time, target_batch, num_heads, dim_per_head].
+      time_step: A scalar, the current decode step, 0-based.
+      use_short_seq_opt: A bool, whether using short sequence optimization.
+
+    Returns:
+      cur_output: [target_batch, 1, dim]
+      updated_states: A `.NestedMap` object containing the updated states.
+      key   - [target_time, target_batch, num_heads, dim_per_head].
+      value - [target_time, target_batch, num_heads, dim_per_head].
+    """
+    target_batch, _, dim = py_utils.GetShape(query_vec, 3)
+    source_batch = py_utils.GetShape(aux_vec)[0]
+
+    # First the self-attention layer.
+    atten_vec, updated_states = self.self_atten.ExtendStep(
+        theta.self_atten, query_vec, cached_states, time_step,
+        use_short_seq_opt)
+
+    # Next the cross-attention layer.
+    atten_vec = tf.reshape(atten_vec, [source_batch, -1, dim])
+    atten_vec, _ = self.cross_atten.FProp(theta.cross_atten, atten_vec, aux_vec,
+                                          aux_paddings)
+    atten_vec = tf.reshape(atten_vec, [target_batch, 1, -1])
+
+    # Finally the feed-forward layer.
+    cur_output = self.fflayer.FProp(
+        theta.fflayer, atten_vec,
+        tf.zeros([target_batch, 1], dtype=atten_vec.dtype))
+
+    if self.params.output_layer_norm:
+      cur_output = self.layer_norm.FProp(theta.layer_norm, cur_output)
     return cur_output, updated_states
 
 

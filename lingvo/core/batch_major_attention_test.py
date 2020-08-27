@@ -1137,6 +1137,104 @@ class LocalSelfAttentionTest(test_utils.TestCase, parameterized.TestCase):
           [5.135725, 1.340482, 1.065773, 4.116683, 4.928454, 3.161165],
           np.sum(new_source_vecs, axis=1))
 
+  def testStreamingExtendStep(self):
+    batch_size = 1
+    input_dim = 4
+    hidden_dim = 4
+    num_heads = 2
+    seq_length = 5
+    left_context = 2
+    with self.session(use_gpu=True):
+      # Prepares inputs.
+      tf.random.set_seed(12345)
+      np.random.seed(123456789)
+      inputs = tf.constant(
+          np.random.normal(0.1, 0.5, [batch_size, seq_length, input_dim]),
+          dtype=tf.float32)
+      paddings = tf.zeros(shape=[batch_size, seq_length], dtype=tf.float32)
+
+      # Prepares the model.
+      p = attention.LocalSelfAttention.Params().Set(
+          name='local_self_atten',
+          num_heads=num_heads,
+          input_dim=input_dim,
+          hidden_dim=hidden_dim,
+          left_context=left_context,
+          right_context=0,
+      )
+      p.params_init = py_utils.WeightInit.Xavier(scale=1.0, seed=0)
+      model = p.Instantiate()
+      self.evaluate(tf.global_variables_initializer())
+
+      outputs, _ = model.FProp(model.theta, inputs, inputs, inputs, paddings)
+      outputs_shape = py_utils.GetShape(outputs)
+      self.assertListEqual([batch_size, seq_length, input_dim], outputs_shape)
+
+      # Streaming inference
+      state = model.zero_state(batch_size)
+      for i in range(0, seq_length):
+        time_step = tf.constant([i], dtype=tf.int32)
+        i_input = inputs[:, i:(i + 1), :]  # [B, 1, D]
+        i_output, state = model.StreamingExtendStep(i_input, state, time_step)
+        i_output_shape = py_utils.GetShape(i_output)
+        self.assertListEqual([batch_size, 1, input_dim], i_output_shape)
+
+        i_expected_output = outputs[:, i:(i + 1), :]
+        v, expected_v = self.evaluate([i_output, i_expected_output])
+        self.assertAllClose(v, expected_v)
+
+
+class LocalSelfAttentionXLTest(test_utils.TestCase, parameterized.TestCase):
+  """Test local causual self attention with relative pos embedding."""
+
+  def testStreamingExtendStep(self):
+    batch_size = 1
+    input_dim = 4
+    hidden_dim = 4
+    num_heads = 2
+    seq_length = 5
+    left_context = 2
+    rel_pos_emb_dim = 2
+    with self.session(use_gpu=True):
+      # Prepares inputs.
+      tf.random.set_seed(12345)
+      np.random.seed(123456789)
+      inputs = tf.constant(
+          np.random.normal(0.1, 0.5, [batch_size, seq_length, input_dim]),
+          dtype=tf.float32)
+      paddings = tf.zeros(shape=[batch_size, seq_length], dtype=tf.float32)
+
+      # Prepares the model.
+      p = attention.LocalSelfAttentionXL.Params().Set(
+          name='local_self_atten_xl',
+          rel_pos_emb_dim=rel_pos_emb_dim,
+          num_heads=num_heads,
+          input_dim=input_dim,
+          hidden_dim=hidden_dim,
+          left_context=left_context,
+          right_context=0,
+      )
+      p.params_init = py_utils.WeightInit.Xavier(scale=1.0, seed=0)
+      model = p.Instantiate()
+      self.evaluate(tf.global_variables_initializer())
+
+      outputs, _ = model.FProp(model.theta, inputs, inputs, inputs, paddings)
+      outputs_shape = py_utils.GetShape(outputs)
+      self.assertListEqual([batch_size, seq_length, input_dim], outputs_shape)
+
+      # Streaming inference
+      state = model.zero_state(batch_size)
+      for i in range(0, seq_length):
+        time_step = tf.constant([i], dtype=tf.int32)
+        i_input = inputs[:, i:(i + 1), :]  # [B, 1, D]
+        i_output, state = model.StreamingExtendStep(i_input, state, time_step)
+        i_output_shape = py_utils.GetShape(i_output)
+        self.assertListEqual([batch_size, 1, input_dim], i_output_shape)
+
+        i_expected_output = outputs[:, i:(i + 1), :]
+        v, expected_v = self.evaluate([i_output, i_expected_output])
+        self.assertAllClose(v, expected_v)
+
 
 class RoutingAttentionTest(test_utils.TestCase, parameterized.TestCase):
   """Tests for RoutingAttention."""
@@ -1169,7 +1267,9 @@ class RoutingAttentionTest(test_utils.TestCase, parameterized.TestCase):
     with self.session() as sess:
       tf.global_variables_initializer().run()
       encoded, probs = sess.run(
-          atten._DotAtten(atten.theta, q, k, v, query_paddings, key_paddings))
+          atten._DotAtten(
+              atten.theta, q, k, v, key_paddings,
+              query_paddings=query_paddings))
       self.assertEqual(encoded.shape,
                        (batch_size, target_length, num_heads, dim_per_head))
       self.assertEqual(probs.shape,
@@ -1219,13 +1319,15 @@ class RoutingAttentionTest(test_utils.TestCase, parameterized.TestCase):
     with self.session() as sess:
       tf.global_variables_initializer().run()
       encoded, probs = sess.run(
-          atten._DotAtten(atten.theta, q, k, v, q_paddings, k_paddings))
+          atten._DotAtten(
+              atten.theta, q, k, v, k_paddings, query_paddings=q_paddings))
       self.assertEqual(encoded.shape,
                        (batch_size, target_length, num_heads, dim_per_head))
       self.assertEqual(probs.shape,
                        (batch_size, target_length, num_heads, source_length))
       _, probs2 = sess.run(
-          atten2._DotAtten(atten2.theta, q, k, v, q_paddings, k_paddings))
+          atten2._DotAtten(
+              atten2.theta, q, k, v, k_paddings, query_paddings=q_paddings))
       # In order to match the full attention, we apply layer norm first.
       q_ln = attention_util.KMeansClusteringForAtten.LayerNorm(q)
       k_ln = attention_util.KMeansClusteringForAtten.LayerNorm(k)
@@ -1297,8 +1399,8 @@ class RoutingAttentionTest(test_utils.TestCase, parameterized.TestCase):
     full_atten = p.Instantiate()
     with self.session() as sess:
       tf.global_variables_initializer().run()
-      encoded_t, probs_t = atten._DotAtten(atten.theta, q, k, v, q_paddings,
-                                           k_paddings)
+      encoded_t, probs_t = atten._DotAtten(
+          atten.theta, q, k, v, k_paddings, query_paddings=q_paddings)
       gradients_t = tf.gradients(encoded_t, [q, k, v])
       # In order to match the full attention, we apply layer norm first.
       q_ln = attention_util.KMeansClusteringForAtten.LayerNorm(q)
@@ -1354,7 +1456,8 @@ class RoutingAttentionTest(test_utils.TestCase, parameterized.TestCase):
     with self.session() as sess:
       tf.global_variables_initializer().run()
       encoded, probs = sess.run(
-          atten._DotAtten(atten.theta, q, k, v, q_paddings, k_paddings))
+          atten._DotAtten(
+              atten.theta, q, k, v, k_paddings, query_paddings=q_paddings))
       # In order to match the full attention, we apply layer norm first.
       q_ln = attention_util.KMeansClusteringForAtten.LayerNorm(q)
       k_ln = attention_util.KMeansClusteringForAtten.LayerNorm(k)
@@ -1409,15 +1512,65 @@ class RoutingAttentionTest(test_utils.TestCase, parameterized.TestCase):
     with self.session() as sess:
       tf.global_variables_initializer().run()
       # self attention path
-      encoded_self_t, probs_self_t = atten._DotAtten(atten.theta, q, q, v,
-                                                     paddings, paddings)
+      encoded_self_t, probs_self_t = atten._DotAtten(
+          atten.theta, q, q, v, paddings, query_paddings=paddings)
       # computed as cross attention
-      encoded_t, probs_t = atten._DotAtten(atten.theta, q, q_copy, v, paddings,
-                                           paddings)
+      encoded_t, probs_t = atten._DotAtten(
+          atten.theta, q, q_copy, v, paddings, query_paddings=paddings)
       encoded, probs, encoded_self, probs_self = sess.run(
           [encoded_t, probs_t, encoded_self_t, probs_self_t])
       self.assertAllClose(probs, probs_self)
       self.assertAllClose(encoded, encoded_self)
+
+  def testExtendStep(self):
+    batch_size = 8
+    target_length = 10
+    num_heads = 4
+    dim_per_head = 5
+    num_clusters = 6
+    attention_window = target_length
+    input_dim = 7
+    q = np.random.rand(batch_size, target_length, input_dim).astype(np.float32)
+    paddings = np.zeros([batch_size, target_length], dtype=np.float32)
+    p = attention.RoutingAttention.Params().Set(
+        name='routing_atten',
+        input_dim=input_dim,
+        hidden_dim=num_heads * dim_per_head,
+        num_heads=num_heads,
+        num_clusters=num_clusters,
+        attention_window=attention_window,
+        causal_masking=True,
+        fast_path=False)
+    p.params_init = py_utils.WeightInit.Xavier(scale=1.0, seed=0)
+    atten = p.Instantiate()
+    # We ensure that the encoded attention result is the same between FProp()
+    # and sequential calls to ExtendStep().
+    with self.session() as sess:
+      # self attention path via ExtendStep
+      encoded_all = []
+      states = atten.InitStates(atten.theta, batch_size, target_length)
+      self.assertEqual(states.key.shape,
+                       (target_length, batch_size, num_heads, dim_per_head))
+      self.assertEqual(states.value.shape,
+                       (target_length, batch_size, num_heads, dim_per_head))
+      self.assertEqual(states.key_dists.shape,
+                       (target_length, batch_size, num_heads, num_clusters))
+      for i in range(target_length):
+        encoded, states = atten.ExtendStep(atten.theta, q[:, i:i + 1, :],
+                                           states, paddings, i)
+        self.assertEqual(encoded.shape, (batch_size, 1, input_dim))
+        encoded_all.append(encoded)
+      encoded_extend_t = tf.concat(encoded_all, axis=1)
+
+      # self attention path via FProp
+      encoded_fprop_t, _ = atten.FProp(atten.theta, q, q, q, paddings)
+      self.assertEqual(encoded_fprop_t.shape,
+                       (batch_size, target_length, input_dim))
+
+      tf.global_variables_initializer().run()
+      encoded_extend, encoded_fprop = sess.run(
+          [encoded_extend_t, encoded_fprop_t])
+      self.assertAllClose(encoded_extend, encoded_fprop)
 
 
 class TransformerLayerTest(test_utils.TestCase, parameterized.TestCase):

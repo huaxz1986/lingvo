@@ -713,13 +713,11 @@ class MultiHeadedAttention(base_layer.BaseLayer):
       raise ValueError('Value projection must be enabled for Transformer '
                        'machine translation.')
 
-    new_key_vec = query_vec
-    new_value_vec = query_vec
     t, b, n, h = py_utils.GetShape(cached_states.key, 4)
 
     # Project inputs to key, value and query. Each has shape [B, 1, N, H].
-    new_key_proj = self.key.FProp(theta.key, new_key_vec)
-    new_value_proj = self.value.FProp(theta.value, new_value_vec)
+    new_key_proj = self.key.FProp(theta.key, query_vec)
+    new_value_proj = self.value.FProp(theta.value, query_vec)
     query_proj = self.query.FProp(theta.query, query_vec)
 
     # The extended_key and extended_value have shape [T, B, N, H].
@@ -730,7 +728,7 @@ class MultiHeadedAttention(base_layer.BaseLayer):
     updated_state = py_utils.NestedMap(key=extended_key, value=extended_value)
 
     if paddings is None:
-      paddings = tf.zeros([b, t], dtype=new_key_vec.dtype)
+      paddings = tf.zeros([b, t], dtype=query_vec.dtype)
 
     encoded = self._DotAttenOneStep(
         theta,
@@ -1318,7 +1316,8 @@ class LocalSelfAttention(MultiHeadedAttention):
                  use_short_seq_opt=False):
     """Computes the value vector given the query of the current step.
 
-    This function is used by autoregressive decoding.
+    This function is used by autoregressive decoding. This function knows the
+    length of full sequence, thus it is different from StreamingExtendStep.
 
     Note: When the context window size is much smaller than target sequence
     length, to make it run more efficent, T below can be just the window size.
@@ -1369,6 +1368,112 @@ class LocalSelfAttention(MultiHeadedAttention):
     return super().ExtendStep(theta, query_vec, cached_states, paddings,
                               segment_mask, per_step_padding, time_step,
                               use_short_seq_opt)
+
+  def zero_state(self, batch_size=1):
+    """Returns the initial state given the batch size.
+
+    Args:
+      batch_size: the batch size.
+
+    Returns:
+      state: The initial state for streaming inference.
+    """
+    p = self.params
+    assert p.enable_value_proj, 'Value projection must be enabled.'
+    assert p.right_context == 0, ('StreamingExtendStep does not support look '
+                                  'ahead')
+    key_state = tf.zeros(
+        shape=[
+            p.left_context, batch_size, p.num_heads, p.hidden_dim // p.num_heads
+        ],
+        dtype=tf.float32)
+    value_state = tf.zeros(
+        shape=[
+            p.left_context, batch_size, p.num_heads, p.hidden_dim // p.num_heads
+        ],
+        dtype=tf.float32)
+    state = py_utils.NestedMap(key=key_state, value=value_state)
+    return state
+
+  def StreamingExtendStep(self, query_vec, state, time_step):
+    """Computes the value vector given the query of the current step.
+
+    This function doesn't know the length of full sequence, thus it is
+    different from ExtendStep.
+
+    Args:
+      query_vec: A query vector of shape [B, 1, D].
+      state: A `.NestedMap` object containing tensors {key, value} which are
+        results of previous attentions. key, value are of shape [T, B, N, H]
+        where T is the state size of this layer.
+      time_step: A tensor of shape [1] and type tf.int32. Note, we can not use
+        scalar tensor here because TfLiteConverter doesn't have good support of
+        it (b/138865275).
+
+    Returns:
+      output: Output of the given query vector with shape [B, 1, D].
+      state: updated state.
+    """
+    p = self.params
+    assert p.enable_value_proj, 'Value projection must be enabled.'
+    assert p.right_context == 0, ('StreamingExtendStep does not support look '
+                                  'ahead')
+    query_vec = py_utils.with_dependencies([
+        py_utils.assert_shape_match(tf.shape(query_vec), [-1, 1, p.input_dim])
+    ], query_vec)
+    state.key = py_utils.with_dependencies([
+        py_utils.assert_shape_match(
+            tf.shape(state.key),
+            [p.left_context, -1, p.num_heads, p.hidden_dim // p.num_heads])
+    ], state.key)
+    state.value = py_utils.with_dependencies([
+        py_utils.assert_shape_match(
+            tf.shape(state.value),
+            [p.left_context, -1, p.num_heads, p.hidden_dim // p.num_heads])
+    ], state.value)
+
+    t, b, n, h = py_utils.GetShape(state.key, 4)  # t: context window size
+
+    # Computes key, value projection and updates state.
+    new_key_proj = self.key.FProp(self.theta.key, query_vec)  # [B, 1, N, H]
+    new_key_proj = tf.reshape(new_key_proj, [1, b, n, h])
+    new_value_proj = self.key.FProp(self.theta.value, query_vec)  # [B, 1, N, H]
+    new_value_proj = tf.reshape(new_value_proj, [1, b, n, h])
+    state.key = tf.concat([state.key[1:, :, :, :], new_key_proj], axis=0)
+    state.value = tf.concat([state.value[1:, :, :, :], new_value_proj], axis=0)
+
+    # For a time step less than the context window size, the time dimension of
+    # input of logits computation is equal to the time step (not a full context
+    # window).
+    t = tf.math.minimum(time_step[0] + 1, t)
+    key_input = state.key[-t:, :, :, :]
+    value_input = state.value[-t:, :, :, :]
+
+    # Computes query projection.
+    query_proj = self.query.FProp(self.theta.query, query_vec)  # [B, 1, N, H]
+
+    # Scales the query projection.
+    if p.enable_per_dim_scale:
+      query_proj = self.per_dim_scale.FProp(self.theta.per_dim_scale,
+                                            query_proj)
+    else:
+      query_proj *= h**-0.5
+    query_proj = tf.reshape(query_proj, [b, n, h])
+
+    # Computes attention outputs.
+    # TODO(wildstone): Replaces the einsum ops used below with mat mul to get
+    # rid of TfLite Flex ops.
+    logits = self._AttenLogitsOneStep(self.theta, query_proj, key_input,
+                                      t - 1)  # [T, B, N]
+    logits = tf.reshape(logits, [t, -1])
+    posteriors = tf.nn.softmax(logits, axis=0)
+    posteriors = tf.reshape(posteriors, [t, b, n])
+    output = tf.einsum('TBN, TBNH->BNH', posteriors, value_input)
+
+    # Post projection.
+    output = tf.expand_dims(output, 1)
+    output = self.post.FProp(self.theta.post, output)
+    return output, state
 
   @classmethod
   def FPropMeta(cls, p, *args):
@@ -1476,6 +1581,45 @@ class LocalSelfAttentionXL(LocalSelfAttention):
       term_bd = tf.reshape(term_d, [1, n, 1, w, c])
     return term_ac + term_bd
 
+  def _AttenLogitsOneStep(self, theta, query, key, time_step):
+    """Attention logits for one single target (query) step.
+
+    Args:
+      theta: A `.NestedMap` object containing weights' values of this layer and
+        its children layers.
+      query:    [B, N, H].
+      key:      [S, B, N, H] or [S, B, N*H/128, 128].
+      time_step: Current time step.
+
+    Returns:
+      A Tensor of shape [S, B, N]
+    """
+    p = self.params
+    s, b, _, _ = py_utils.GetShape(key, 4)
+    n = p.num_heads
+    h = p.hidden_dim // n
+
+    # Transformer_XL relative attention.
+    if time_step is None:
+      raise ValueError('`time_step` can not be None when using relative '
+                       'position encoding in attention.')
+    # term a and c.
+    logits = tf.einsum('BNH,SBNH->SBN', query + theta.u,
+                       tf.reshape(key, [s, b, n, h]))
+    position = tf.expand_dims(time_step - tf.range(s), 0)
+    # [1, s, emb_dim]
+    sin_emb = self.pos_emb.FPropWithPosition(theta.pos_emb, position)
+    sin_emb = self.pos_proj.FProp(theta.pos_proj, sin_emb)
+    # [s, n, h]
+    sin_emb = tf.squeeze(sin_emb, 0)
+
+    # term b an d.
+    if not p.skip_term_b:
+      logits += tf.einsum('BNH,SNH->SBN', query + theta.v, sin_emb)
+    else:
+      logits += tf.expand_dims(tf.einsum('NH,SNH->SN', theta.v, sin_emb), 1)
+    return logits
+
 
 class RoutingAttention(MultiHeadedAttention):
   """"Implements a sparse attention based on k-means clustering.
@@ -1489,11 +1633,12 @@ class RoutingAttention(MultiHeadedAttention):
   we layer normalize queries and keys first so that closeness lead to a larger
   dot product.
 
-  TODO(zhouwk) This class is WIP, what remains to be done:
-    * single step during decoding
+  TODO(zhouwk) This class is missing the following features:
     * propagate clustering loss;
     * supporting packed inputs;
-    * support attention dropout.
+    * support attention dropout;
+    * support relative position encoding;
+    * support using local attention on some heads.
 
   We use the following capital letters to denote shape parameters:
     B = batch size
@@ -1501,6 +1646,7 @@ class RoutingAttention(MultiHeadedAttention):
     T = length of the target sequence
     N = number of attention heads
     H = dimensions of each attention head
+    D = model dimension
 
     K = number of clusters
     W = attention window
@@ -1550,7 +1696,15 @@ class RoutingAttention(MultiHeadedAttention):
     clustering_p.apply_layer_norm = False
     self.CreateChild('clustering', clustering_p)
 
-  def _DotAtten(self, theta, query, key, value, query_paddings, key_paddings):
+  def _DotAtten(self,
+                theta,
+                query,
+                key,
+                value,
+                paddings,
+                segment_mask=None,
+                per_step_padding=None,
+                query_paddings=None):
     """Computes the attention.
 
     Each query selects 'p.attention_window' number of keys to attend to. First
@@ -1573,14 +1727,23 @@ class RoutingAttention(MultiHeadedAttention):
       query: [B, T, N, H].
       key:   [B, S, N, H].
       value: [B, S, N, H].
-      query_paddings: [B, T].
-      key_paddings:   [B, S].
+      paddings:   [B, S], paddings for key.
+      segment_mask: must be None.
+      per_step_padding: must be None. Please use p.causal_masking.
+      query_paddings: [B, T], or None.
 
     Returns:
       encoded: [B, T, N, H].
       atten_probs: [B, T, N, S].
     """
     p = self.params
+    if segment_mask is not None or per_step_padding is not None:
+      raise ValueError('Requires segment_mask=None and per_step_padding=None.')
+    key_paddings = paddings
+    b, t = py_utils.GetShape(query, 2)
+    if query_paddings is None:
+      query_paddings = tf.zeros([b, t], dtype=key_paddings.dtype)
+
     is_self_attention = (query is key)
     # Whether to update the centroids. Only do this during training.
     update = not self.do_eval
@@ -1605,8 +1768,171 @@ class RoutingAttention(MultiHeadedAttention):
       return self._DotAttenSlowPath(theta, query, key, value, q_dists, k_dists,
                                     query_paddings, key_paddings)
 
-  def _DotAttenSlowPath(self, theta, query, key, value, q_dists, k_dists,
-                        query_paddings, key_paddings):
+  def InitStates(self, theta, target_batch_size, target_max_length):
+    """Initialize 'states' with .key, .value, and .key_dists."""
+    p = self.params
+    states = super().InitStates(theta, target_batch_size, target_max_length)
+    states.key_dists = inplace_ops.empty(
+        shape=(target_max_length, target_batch_size, p.num_heads,
+               p.num_clusters),
+        dtype=py_utils.FPropDtype(p),
+        init=True)
+    return states
+
+  def ExtendStep(self,
+                 theta,
+                 query_vec,
+                 cached_states,
+                 paddings,
+                 time_step,
+                 segment_mask=None,
+                 per_step_padding=None,
+                 use_short_seq_opt=False):
+    """Computes the value vector given the query of the current step.
+
+    This function is used by autoregressive decoding. Used for self-attention
+    (hence S=T) with p.causal_masking is True.
+
+    We compute the key/value/key_dists at `time_step` and cache the updated
+    full length results in `cache_states` to reduce duplicate computation.
+
+    p.fast_path is ignored (as if p.fast_path=False) as at each step we only
+    compute for query of length 1.
+
+    Args:
+      theta: A `.NestedMap` object containing weights' values of this layer and
+        its children layers.
+      query_vec:         [B, 1, D].
+      cached_states:     A `.NestedMap` object containing tensors which are the
+        results of previous attentions, used for fast decoding. It contains .key
+        and .value with shape [T, B, N, H], and .key_dists with  shape [T, B, N,
+        K]. Note that they are all time-major.
+      paddings:          [B, T], or None if there is no padding.
+      time_step:         Scalar, the current decode step, 0-based.
+      segment_mask:      must be None.
+      per_step_padding:  must be None. We obey causal masking.
+      use_short_seq_opt: must be False.
+
+    Returns:
+      encoded:           [B, 1, D].
+      updated_states:    `.NestedMap` with .key, .value, .key_dists.
+
+    Raises:
+      ValueError: If value projection is disabled.
+    """
+    p = self.params
+    if not p.enable_value_proj:
+      raise ValueError('Value projection must be enabled: '
+                       'set p.enable_value_proj = True.')
+    if not p.causal_masking:
+      raise ValueError('p.causal_masking must be true.')
+    if segment_mask is not None or per_step_padding is not None:
+      raise ValueError('Requires segment_mask=None and per_step_padding=None.')
+    if use_short_seq_opt:
+      raise ValueError('Requires use_short_seq_opt=False.')
+    if time_step is None:
+      raise ValueError('Requires valid time_step, not None.')
+
+    t, b, n, h = py_utils.GetShape(cached_states.key, 4)
+
+    # Project inputs to key, value and query. Each has shape [B, 1, N, H].
+    key_proj = self.key.FProp(theta.key, query_vec)
+    value_proj = self.value.FProp(theta.value, query_vec)
+    query_proj = self.query.FProp(theta.query, query_vec)
+
+    query_proj = attention_util.KMeansClusteringForAtten.LayerNorm(query_proj)
+    key_proj = attention_util.KMeansClusteringForAtten.LayerNorm(key_proj)
+    # [B, 1, N, K]
+    k_dists, _ = self.clustering.FProp(theta.clustering, key_proj)
+
+    # The updated_key and extended_value have shape [T, B, N, H].
+    updated_key = inplace_ops.alias_inplace_update(
+        cached_states.key, time_step, tf.reshape(key_proj, [b, n, h]))
+    updated_value = inplace_ops.alias_inplace_update(
+        cached_states.value, time_step, tf.reshape(value_proj, [b, n, h]))
+    # Shape [T, B, N, K]
+    updated_key_dists = inplace_ops.alias_inplace_update(
+        cached_states.key_dists, time_step,
+        tf.reshape(k_dists, [b, n, p.num_clusters]))
+    updated_states = py_utils.NestedMap(
+        key=updated_key, value=updated_value, key_dists=updated_key_dists)
+
+    if paddings is None:
+      paddings = tf.zeros([b, t], dtype=query_vec.dtype)
+    # Apply causal padding. Shape [B, T]
+    paddings = tf.where(
+        tf.greater(
+            tf.tile(tf.range(t)[None, :], [b, 1]), tf.fill([b, t], time_step)),
+        tf.ones_like(paddings), paddings)
+    query_paddings = tf.zeros([b, 1], dtype=paddings.dtype)
+
+    encoded = self._DotAttenOneStep(
+        theta,
+        query_proj,
+        updated_states,
+        query_paddings=query_paddings,
+        key_paddings=paddings,
+        time_step=time_step)
+    # Post projection.
+    encoded = self.post.FProp(theta.post, encoded)
+    return encoded, updated_states
+
+  def _DotAttenOneStep(self, theta, query, states, query_paddings, key_paddings,
+                       time_step):
+    """Dot attention function for queries with 1 time step.
+
+    Called from ExtendStep(). Used for self-attention with p.causal_masking
+    is True.
+
+    Args:
+      theta: A `.NestedMap` object containing weights' values of this layer and
+        its children layers.
+      query:    [B, 1, N, H], already normalized.
+      states:   .key and .value with shape [T, B, N, H], .key_dists with shape
+        [T, B, N, K]. .key is normalized.
+      query_paddings: [B, 1].
+      key_paddings: [B, T].
+      time_step: Scalar, the current decode step, 0-based.
+
+    Returns:
+      encoded: [B, 1, N, H].
+    """
+    p = self.params
+    # [B, 1, N, K]
+    q_dists, _ = self.clustering.FProp(theta.clustering, query)
+    # [B, T, N, K]
+    k_dists = tf.transpose(states.key_dists, [1, 0, 2, 3])
+
+    very_large_dists = tf.ones_like(k_dists) * tf.constant(
+        0.1, dtype=k_dists.dtype) * k_dists.dtype.max
+    paddings_tiled = tf.tile(key_paddings[:, :, None, None],
+                             [1, 1, p.num_heads, p.num_clusters])
+    k_dists = tf.where(paddings_tiled > 0.0, very_large_dists, k_dists)
+
+    key = tf.transpose(states.key, [1, 0, 2, 3])
+    value = tf.transpose(states.value, [1, 0, 2, 3])
+    encoded, _ = self._DotAttenSlowPath(
+        theta,
+        query,
+        key,
+        value,
+        q_dists,
+        k_dists,
+        query_paddings,
+        key_paddings,
+        query_relative_position_shift=time_step)
+    return encoded
+
+  def _DotAttenSlowPath(self,
+                        theta,
+                        query,
+                        key,
+                        value,
+                        q_dists,
+                        k_dists,
+                        query_paddings,
+                        key_paddings,
+                        query_relative_position_shift=0):
     """Computes the attention via the slow path.
 
     This implementation selects, on a per query basis, p.attention_window
@@ -1621,6 +1947,9 @@ class RoutingAttention(MultiHeadedAttention):
       k_dists: [B, S, N, K].
       query_paddings: [B, T].
       key_paddings:   [B, S].
+      query_relative_position_shift: scalar. The position (relative to key[0])
+         of query[0]. This impacts relative position encoding (not yet
+         implemented) and causal masking.
 
     Returns:
       encoded: [B, T, N, H].
@@ -1651,10 +1980,10 @@ class RoutingAttention(MultiHeadedAttention):
                                  closest_indices)
     if p.causal_masking:
       batch_size, q_length, num_heads = py_utils.GetShape(query, 3)
+      query_positions = tf.range(q_length) + query_relative_position_shift
       # [B, T, N, W] where the T dimension is range(T)
-      query_positions = tf.tile(
-          tf.range(q_length)[None, :, None, None],
-          [batch_size, 1, num_heads, p.attention_window])
+      query_positions = tf.tile(query_positions[None, :, None, None],
+                                [batch_size, 1, num_heads, p.attention_window])
       masked_indices = -tf.ones_like(sparsity_indices)
       # Replace key positions in the future with -1 to indicate masking.
       #
@@ -2184,7 +2513,8 @@ class TransformerAttentionLayer(base_layer.BaseLayer):
                  use_short_seq_opt=False):
     """Compute the result and update cached states for the current step.
 
-    This function is used by autoregressive decoding.
+    This function is used by autoregressive decoding. This function knows the
+    length of full sequence, thus it is different from StreamingExtendStep.
 
     Args:
       theta: A `.NestedMap` object containing weights' values of this layer and
@@ -2238,6 +2568,49 @@ class TransformerAttentionLayer(base_layer.BaseLayer):
     if p.add_skip_connection:
       ctx_vec += input_to_add
     return ctx_vec, updated_states
+
+  def zero_state(self, batch_size=1):
+    """Returns the initial state given the batch size.
+
+    Args:
+      batch_size: the batch size.
+
+    Returns:
+      state: The initial state for streaming inference.
+    """
+    return self.atten.zero_state(batch_size)
+
+  def StreamingExtendStep(self, query_vec, state, time_step):
+    """Computes the value vector given the query of the current step.
+
+    Args:
+      query_vec: A query vector of shape [B, 1, D].
+      state: A `.NestedMap` object containing tensors {key, value} which are
+        results of previous attentions. key, value are of shape [T, B, N, H]
+        where T is the context size of this layer.
+      time_step: A tensor of shape [1] and type tf.int32. Note, we can not use
+        scalar tensor here because TfLiteConverter doesn't have good support of
+        it (b/138865275).
+
+    Returns:
+      output: Output of the given query vector with shape [B, 1, D].
+      state: updated state.
+    """
+    assert isinstance(self.atten, LocalSelfAttention) or isinstance(
+        self.atten, LocalSelfAttentionXL)
+
+    p = self.params
+    unnormalized_query_vec = query_vec
+    if p.ln_tpl:
+      query_vec = self.layer_norm.FProp(self.theta.layer_norm, query_vec)
+    output, state = self.atten.StreamingExtendStep(query_vec, state, time_step)
+
+    # Residual connection.
+    input_to_add = (
+        unnormalized_query_vec if p.add_unnormalized_input else query_vec)
+    if p.add_skip_connection:
+      output += input_to_add
+    return output, state
 
 
 class TransformerMultiSourceAttentionLayer(TransformerAttentionLayer):
@@ -2523,18 +2896,18 @@ class TransformerLayer(base_layer.BaseLayer):
       value - [target_time, target_batch, num_heads, dim_per_head].
     """
     target_batch, _, dim = py_utils.GetShape(query_vec, 3)
-    source_batch = self._GetSourceBatchSize(aux_vec)
 
     # First the self-attention layer.
     atten_vec, updated_states = self.self_atten.ExtendStep(
         theta.self_atten, query_vec, cached_states, time_step,
         use_short_seq_opt)
-
-    # Next the cross-attention layer.
-    atten_vec = tf.reshape(atten_vec, [source_batch, -1, dim])
-    atten_vec, _ = self.cross_atten.FProp(theta.cross_atten, atten_vec, aux_vec,
-                                          aux_paddings)
-    atten_vec = tf.reshape(atten_vec, [target_batch, 1, -1])
+    if self.params.has_aux_atten:
+      source_batch = self._GetSourceBatchSize(aux_vec)
+      # Next the cross-attention layer.
+      atten_vec = tf.reshape(atten_vec, [source_batch, -1, dim])
+      atten_vec, _ = self.cross_atten.FProp(theta.cross_atten, atten_vec,
+                                            aux_vec, aux_paddings)
+      atten_vec = tf.reshape(atten_vec, [target_batch, 1, -1])
 
     # Finally the feed-forward layer.
     cur_output = self.fflayer.FProp(
@@ -2790,7 +3163,8 @@ class StackedTransformerLayers(base_layer.BaseLayer):
       aux_segment_mask: [batch, 1, target_time, source_time]
 
     Returns:
-      The attention context vector with shape [batch, target_time, dim].
+      (context, paddings), where the context vector has shape [batch,
+      target_time, dim].
     """
     p = self.params
     x_out = query_vec
@@ -3252,6 +3626,11 @@ class Builder(builder.Base):
     p.Define('use_bias', True, 'Whether to use bias for projection layer.')
     p.Define('norm_layer_tpl', None,
              'If specified, the normalization layer template.')
+    p.Define(
+        'enable_scaling_code_motion', False, 'Move scalings from the side '
+        'of T^2 to the side of T for better performance. This may result '
+        'in model quality drops when using bf16 for some models due to '
+        'different XLA fusion decisions.')
     return p
 
   def __init__(self, params):
@@ -3318,7 +3697,8 @@ class Builder(builder.Base):
         enable_per_dim_scale=p.enable_per_dim_scale,
         packed_input=p.packed_input,
         fprop_dtype=p.fprop_dtype,
-        use_bias=p.use_bias
+        use_bias=p.use_bias,
+        enable_scaling_code_motion=p.enable_scaling_code_motion,
     )
     if p.deterministic_dropout:
       atten_p.dropout_tpl = layers.DeterministicDropoutLayer.Params()

@@ -316,7 +316,7 @@ class MultiHeadedAttention(base_layer.BaseLayer):
     Returns:
       A Tensor of shape [B, N, T, S]
     """
-    return tf.einsum('BTNH,BSNH->BNTS', query, key)
+    return attention_util.AttenLogits(query, key)
 
   def _AttenLogitsOneStep(self, theta, query, key, time_step):
     """Attention logits for one single target (query) step.
@@ -410,7 +410,7 @@ class MultiHeadedAttention(base_layer.BaseLayer):
     return probs, probs_sum
 
   def _AttenContext(self, theta, probs, value):
-    return tf.einsum('BNTS,BSNH->BTNH', probs, value)
+    return attention_util.AttenContext(probs, value)
 
   def _AttenContextOneStep(self, theta, probs, value, time_step):
     s, b, _, _ = py_utils.GetShape(value, 4)
@@ -1217,7 +1217,7 @@ class LocalSelfAttention(MultiHeadedAttention):
                  key,
                  paddings,
                  segment_mask,
-                 unused_per_step_padding=None):
+                 per_step_padding=None):
     """Compute attention probability.
 
     Args:
@@ -1227,11 +1227,13 @@ class LocalSelfAttention(MultiHeadedAttention):
       key:      [B, S=T, N, H].
       paddings: [B, T].
       segment_mask: [B, 1, T, S] not used right now.
-      unused_per_step_padding: Not used.
+      per_step_padding: Not used.
 
     Returns:
-      logits: [B, U, N, W, 2 * W]
+      probs: [B, U, N, W, 2 * W]
+      probs_sum: [B, U, N, W, 1].
     """
+    del per_step_padding
     p = self.params
     key = py_utils.HasRank(key, 4)
     b, t, n, h = py_utils.GetShape(key, 4)
@@ -1281,48 +1283,31 @@ class LocalSelfAttention(MultiHeadedAttention):
         tf.constant(-0.7, dtype=logits.dtype))
     padded_logits = tf.where(paddings > 0.0, very_negative_logits, logits)
 
-    probs = tf.nn.softmax(padded_logits)
-    return probs
+    if p.enable_scaling_code_motion:
+      # Split the softmax into two parts. Do the 1st part here; the 2nd part
+      # (scaling) is moved after _AttenContext for better performance.
+      probs = padded_logits - tf.stop_gradient(
+          tf.reduce_max(padded_logits, -1, True))
+      probs = tf.cast(tf.exp(probs), key.dtype)
+      probs_sum = tf.reduce_sum(probs, -1, True)
+    else:
+      probs = tf.cast(tf.nn.softmax(padded_logits), key.dtype)
+      probs_sum = None
 
-  def _DotAtten(self,
-                theta,
-                query,
-                key,
-                value,
-                paddings,
-                segment_mask,
-                per_step_padding=None):
-    """Main attention function.
+    return probs, probs_sum
+
+  def _AttenContext(self, theta, probs, value):
+    """Computes the local attention context vector.
 
     Args:
-      theta: A `.NestedMap` object containing weights' values of this layer and
-        its children layers.
-      query:    [B, T, N, H].
-      key:      [B, S=T, N, H].
-      value:    [B, S=T, N, H].
-      paddings: [B, S=T].
-      segment_mask: [B, 1, S=T, S=T].
-      per_step_padding: A mask of shape [B, T, S=T] if not None.
+     theta: Layer theta: NestedMap.
+     probs: Local-self-MultiHeaded Attention probablities: [B, N, U, W, C].
+     value: Input value vector: [B, S=T, N, H].
 
     Returns:
-      encoded: [B, T, N, H].
-      atten_probs: [B, N, T, S].
+     encoded: Attention context vector: [B, T, N, H].
     """
     p = self.params
-    # Scale the query projection.
-    if p.enable_per_dim_scale:
-      query = self.per_dim_scale.FProp(theta.per_dim_scale, query)
-    else:
-      query *= (p.hidden_dim // p.num_heads)**-0.5
-    t0 = py_utils.GetShape(query)[1]
-
-    # -> [B, N, U, W, C]
-    probs = self.AttenProbs(theta, query, key, paddings, segment_mask,
-                            per_step_padding)
-
-    # Apply dropout to probs.
-    probs = self.atten_dropout.FProp(theta.atten_dropout, probs)
-
     # -> [B, U, C, N, H]
     value_block_context = attention_util.ExtractBlockContext(
         value,
@@ -1336,8 +1321,55 @@ class LocalSelfAttention(MultiHeadedAttention):
     b, u, w, n, h = py_utils.GetShape(encoded)
     encoded = tf.reshape(encoded, [b, u * w, n, h])
     # Remove the extra time padding introduced by converting to blocks.
+    # Note: t0 works presently only for self-attention.
+    # For cross-atten, needs query[1] which'll be different.
+    t0 = py_utils.GetShape(value)[1]
     encoded = encoded[:, :t0, ...]
-    return encoded, probs
+    return encoded
+
+  def FProp(self,
+            theta,
+            query_vec,
+            key_vec,
+            value_vec,
+            paddings,
+            segment_mask=None,
+            per_step_padding=None):
+    """Computes the value vector given the current query output.
+
+    Args:
+      theta: A `.NestedMap` object containing weights' values of this layer and
+        its children layers.
+      query_vec: [B, T, D].
+      key_vec:   [B, S, D] with S == T (self-attention).
+      value_vec: [B, S, D] with S == T (self-attention).
+      paddings:  [B, S] with S == T (self-attention).
+      segment_mask: [B, 1, T, S]. A mask only applied if packed_input=True.
+      per_step_padding: A mask used by decoder self-attention to prevent
+        information flow from future (causal padding). It has shape [B, T, T] if
+        not None.
+
+    Returns:
+      encoded: [B, T, D].
+      atten_probs: [B, N, T, S].
+
+    Raises:
+      ValueError: If value projection is disabled.
+    """
+    b, t, d = py_utils.GetShape(query_vec, 3)
+    # LocalSelfAttention doesn't support cross-attention at the moment.
+    # Verify T == S, for query and value vector.
+    value_vec = py_utils.HasShape(value_vec, [b, t, d])
+    key_vec = py_utils.HasShape(key_vec, [b, t, d])
+    paddings = py_utils.HasShape(paddings, [b, t])
+    return super().FProp(
+        theta,
+        query_vec,
+        key_vec,
+        value_vec,
+        paddings,
+        segment_mask=segment_mask,
+        per_step_padding=per_step_padding)
 
   def ExtendStep(self,
                  theta,
@@ -3175,8 +3207,11 @@ class StackedTransformerLayers(base_layer.BaseLayer):
              'Apply dropout at this prob at various places.')
     p.Define('add_unnormalized_input', True,
              'If set, uses unnormalized input in the residual add.')
-    p.Define('transformer_layer_params_tpl', TransformerLayer.Params(),
-             'A template of TransformerLayer.params.')
+    p.Define(
+        'transformer_layer_params_tpl', TransformerLayer.Params(),
+        'A template of TransformerLayer.params, can be a list of params '
+        'of length equal to the num_layers or a factor of num_layers.'
+        'For a factor, the params are tiled as [a, a, ..., b, b,...,].')
     p.Define('final_layer_norm', False,
              'If true, apply layer normalization to the final output.')
     p.Define('packed_input', False,
@@ -3205,9 +3240,18 @@ class StackedTransformerLayers(base_layer.BaseLayer):
     assert p.num_atten_heads > 0
     assert 0.0 <= p.dropout_prob < 1.0
 
+    if isinstance(p.transformer_layer_params_tpl, list):
+      if p.num_layers % len(p.transformer_layer_params_tpl):
+        raise ValueError('num_layers should be divisible by '
+                         'transformer_layer_params_tpl')
+
     def _LayerParams(ii):
       """Construct ii-th layer params."""
-      p_ii = p.transformer_layer_params_tpl.Copy()
+      if isinstance(p.transformer_layer_params_tpl, list):
+        i = ii // len(p.transformer_layer_params_tpl)
+        p_ii = p.transformer_layer_params_tpl[i].Copy()
+      else:
+        p_ii = p.transformer_layer_params_tpl.Copy()
       p_ii.name = 'layer_%d' % ii
       p_ii.has_aux_atten = p.has_aux_atten
       p_ii.mask_self_atten = p.mask_self_atten
@@ -3673,6 +3717,125 @@ class GPipeBatchMajorTransformerLayer(TransformerLayer):
     return cur_output, updated_states
 
 
+class ResidualAddLayer(base_layer.BaseLayer):
+  """A layer to add inputs with residual weight."""
+
+  @classmethod
+  def Params(cls):
+    """Params for `ResidualAddLayer`."""
+    p = super().Params()
+    p.Define('residual_weight', 1.0, 'Residual weight.')
+    return p
+
+  def FProp(self, theta, x, y):
+    """Return combined inputs.
+
+    Args:
+      theta: weights defined in this layer.
+      x: input tensor.
+      y: input tensor to apply weight to.
+
+    Returns:
+      Added tensors.
+    """
+    p = self.params
+    return x + p.residual_weight * y
+
+  @classmethod
+  def FPropMeta(cls, p, x, y):
+    py_utils.CheckShapes((x, y))
+    return py_utils.NestedMap(flops=x.num_elements() * 2, out_shapes=(x,))
+
+
+class PaddingLayer(base_layer.BaseLayer):
+  """A layer that applies paddings to the inputs."""
+
+  def FProp(self, theta, inputs, paddings):
+    """Return combined inputs.
+
+    Args:
+      theta: weights defined in this layer.
+      inputs: input tensor.
+      paddings: paddings tensor, should be of shape tf.shape(inputs)[:-1].
+
+    Returns:
+      Tensor with paddings applied.
+    """
+    return py_utils.ApplyPadding(tf.expand_dims(paddings, -1), inputs)
+
+  @classmethod
+  def FPropMeta(cls, p, inputs, paddings):
+    py_utils.CheckShapes((inputs, paddings))
+    return py_utils.NestedMap(
+        flops=max(inputs.num_elements(), paddings.num_elements()) * 2,
+        out_shapes=(inputs,))
+
+
+class StrideLayer(base_layer.BaseLayer):
+  """A layer that does stride."""
+
+  @classmethod
+  def Params(cls):
+    """Params for `StrideLayer`."""
+    p = super().Params()
+    p.Define(
+        'stride', 0, 'To use every k-th token, set the stride to k. When '
+        'stride == 0, only returns the first token of the input. When '
+        'stride == 1, returns every token in the input.')
+    p.Define(
+        'first_n', None, 'only considers the first N tokens for the '
+        'output. We use [:first_n:stride] to select the output tokens. If '
+        'first_n is None, this flag is a no-op. If stride is positive, the'
+        ' output sequence length is "(first_n-1) // stride + 1". If stride'
+        ' is 0, first_n has to be None or 1. first_n ca not be 0. If '
+        'first_n <= stride, only the first token is used.')
+    return p
+
+  def FProp(self, theta, x):
+    """Applies stride to the inputs.
+
+    Args:
+      theta: weights defined in this layer.
+      x: input tensor, [batch, time, ...]. Stride is applied to the time dim.
+
+    Returns:
+      Strided tensor, with the stride applied to the second dim in x.
+    """
+    p = self.params
+    assert p.first_n is None or p.first_n > 0
+    if p.stride == 0:
+      assert p.first_n is None or p.first_n == 1
+      return tf.expand_dims(x[:, 0], 1)
+
+    if p.first_n:
+      return x[:, :p.first_n:p.stride]
+
+    if p.stride == 1:
+      return x
+
+    return x[:, ::p.stride]
+
+  @classmethod
+  def FPropMeta(cls, p, x):
+    py_utils.CheckShapes((x,))
+    if p.stride == 0:
+      return py_utils.NestedMap(
+          flops=1, out_shapes=(tshape.Shape(x[0:1] + [1] + x[2:]),))
+
+    if p.first_n:
+      # out_seq_len is 1 if first_n is 1 ~ stride and is 2 if it's stride+1 ~
+      # 2*stride...
+      out_seq_len = (p.first_n - 1) // p.stride + 1
+      return py_utils.NestedMap(
+          flops=1, out_shapes=(tshape.Shape(x[0:1] + [out_seq_len] + x[2:]),))
+
+    if p.stride == 1:
+      return py_utils.NestedMap(flops=0, out_shapes=(x,))
+
+    return py_utils.NestedMap(
+        flops=1, out_shapes=(tshape.Shape(x[0:1] + x[1] // p.stride + x[2:]),))
+
+
 # pyformat: disable
 class Builder(builder.Base):
   """Builder for self-attention layers."""
@@ -3688,7 +3851,7 @@ class Builder(builder.Base):
     p.Define('residual_dropout_prob', 0,
              'Dropout prob to the output of each sub-layer before it is added '
              'to the sub-layer input.')
-    p.Define('ff_activation_fn', tf.nn.relu,
+    p.Define('ff_activation_fn', 'RELU',
              'Activation function in Feedforward layer.')
     p.Define('ff_residual_weight', 1.0, 'Weight given to F(x) in the residual '
              'connection: y = x + ff_residual_weight * F(x), in Feedforward '
@@ -3741,8 +3904,7 @@ class Builder(builder.Base):
     return super()._Dropout(name, keep_prob=1.0 - drop_prob)
 
   def _Add(self, name, residual_weight=1.0):
-    return self._Fn(name, fn=lambda x, y: x + residual_weight * y,
-                    fn_out=lambda x, y: x)
+    return ResidualAddLayer.Params().Set(residual_weight=residual_weight)
 
   def _ExpandDims(self, name):
     return self._Fn(name,
@@ -3773,11 +3935,7 @@ class Builder(builder.Base):
                     fn_flops=lambda x: 15 * x.size)
 
   def _Pad(self, name):
-    return self._Fn(
-        name,
-        fn=lambda x, p: py_utils.ApplyPadding(tf.expand_dims(p, -1), x),
-        fn_out=lambda x, p: x,
-        fn_flops=lambda x, p: 2 * max(x.size, p.size))
+    return PaddingLayer.Params().Set(name=name)
 
   def _MultiHeadedAtten(self, name, num_heads=None):
     """Returns a MultiHeadedAttention params."""
@@ -3991,33 +4149,7 @@ class Builder(builder.Base):
     Returns:
       A layer params that does stride.
     """
-    assert first_n is None or first_n > 0
-    if stride == 0:
-      assert first_n is None or first_n == 1
-      return self._Fn(
-          name=name,
-          fn=lambda x: tf.expand_dims(x[:, 0], 1),
-          fn_out=lambda x: tshape.Shape(x[0:1] + [1] + x[2:]),
-          fn_flops=lambda x: 1)
-
-    if first_n:
-      # out_seq_len is 1 if first_n is 1 ~ stride and is 2 if it's stride+1 ~
-      # 2*stride...
-      out_seq_len = (first_n - 1) // stride + 1
-      return self._Fn(
-          name=name,
-          fn=lambda x: x[:, :first_n:stride],
-          fn_out=lambda x: tshape.Shape(x[0:1] + [out_seq_len] + x[2:]),
-          fn_flops=lambda x: 1)
-
-    if stride == 1:
-      return self._Id(name)
-
-    return self._Fn(
-        name=name,
-        fn=lambda x: x[:, ::stride],
-        fn_out=lambda x: tshape.Shape(x[0:1] + x[1] // stride + x[2:]),
-        fn_flops=lambda x: 1)
+    return StrideLayer.Params().Set(stride=stride, first_n=first_n, name=name)
 
   def _StridedAttention(self, name, stride=1, first_n=None, num_heads=None):
     """Computes self attention with optional stride.

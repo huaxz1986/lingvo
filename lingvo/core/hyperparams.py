@@ -22,6 +22,7 @@ import importlib
 import inspect
 import re
 import sys
+from typing import TypeVar, Generic
 
 import dataclasses
 import lingvo.compat as tf
@@ -486,7 +487,8 @@ class Params:
         # We represent a NoneType by the absence of any of the oneof.
         pass
       else:
-        raise AttributeError('Unsupported type: %s' % type(val))
+        raise AttributeError('Unsupported type: %s for value %s' %
+                             (type(val), val))
       return param_pb
 
     def _ToParam(val):
@@ -833,7 +835,10 @@ class Params:
     return TextDiffHelper(self, other, spaces=' ')
 
 
-class InstantiableParams(Params):
+T = TypeVar('T')
+
+
+class InstantiableParams(Params, Generic[T]):
   """Params which can be instantiated.
 
   When using InstantiableParams, callers must provide a class which supports
@@ -843,11 +848,11 @@ class InstantiableParams(Params):
   class.
   """
 
-  def __init__(self, cls=None):
+  def __init__(self, cls: T = None):
     super().__init__()
     self.Define('cls', cls, 'Cls that this param object is associated with.')
 
-  def Instantiate(self, **args):
+  def Instantiate(self, **args) -> T:
     """Instantiate an instance that this Params is configured for.
 
     Example:
@@ -886,6 +891,6 @@ class InstantiableParams(Params):
     # The class initializer is expected to support initialization using Params.
     return self.cls(self, **args)
 
-  def Copy(self):
+  def Copy(self) -> 'InstantiableParams[T]':
     """See base class."""
     return self._CopyTo(type(self)(self.cls))

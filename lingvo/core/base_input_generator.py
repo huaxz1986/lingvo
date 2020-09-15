@@ -112,11 +112,6 @@ class BaseInputGenerator(base_layer.BaseLayer):
              'Params to configure remote input policy.')
     pp = p.remote
     pp.Define(
-        'shardable_batch', True,
-        'True if and only if this input generates simple batches whose 1st '
-        'dimension of every tensor in a batch is the batch dimension, and '
-        'other dimensions are always the same.')
-    pp.Define(
         'max_inflights_per_target', 32, 'The maximum number of '
         'concurrent inflight remote input fetches per remote target.')
 
@@ -225,6 +220,7 @@ class BaseInputGenerator(base_layer.BaseLayer):
     assert not self._tpu_queues, ('CreateTpuEnqueueOps should only be called '
                                   'once.')
     self._tpu_queues = []
+    self._per_host_batches = []
     p = self.params
     cluster = self.cluster
     num_tpu_hosts = cluster.num_tpu_hosts
@@ -272,23 +268,24 @@ class BaseInputGenerator(base_layer.BaseLayer):
     for task_id in range(num_infeed_hosts):
       host_device = '/task:{}/device:CPU:0'.format(task_id)
       with tf.device(host_device):
-        self._batch = self.GetPreprocessedInputBatch()
-        if isinstance(self._batch, py_utils.NestedMap):
+        batch = self.GetPreprocessedInputBatch()
+        if isinstance(batch, py_utils.NestedMap):
           # Hack: bucket_keys and xxx.bucket_keys are not needed on TPU.
           # Note that when MultiTaskData is used, bucket_keys will be at the
           # second level of the dictionary.
-          self._batch = self._batch.FilterKeyVal(
-              lambda k, _: not k.endswith('bucket_keys'))
-        tf.logging.info('host_device: %s, batch: %r', host_device, self._batch)
+          batch = batch.FilterKeyVal(lambda k, _: not k.endswith('bucket_keys'))
+        self._batch_nm_types = batch
+        tf.logging.info('host_device: %s, batch: %r', host_device, batch)
+        self._per_host_batches.append(batch)
 
-        for k, x in self._batch.FlattenItems():
+        for k, x in batch.FlattenItems():
           assert x.shape.is_fully_defined(), (
               'Shape must be fully defined: %s: %s' % (k, x))
           # TODO(cwhipkey): if it's a string (or other type not supported on
           # TPU), drop it from feeding and on the other end add in an op that
           # fails if used.
-        shapes = self._batch.Transform(lambda x: x.shape).Flatten()
-        dtypes = self._batch.Transform(lambda x: x.dtype).Flatten()
+        shapes = batch.Transform(lambda x: x.shape).Flatten()
+        dtypes = batch.Transform(lambda x: x.dtype).Flatten()
 
         tf.logging.info('host_device: %s infeed shapes: %r', host_device,
                         shapes)
@@ -326,7 +323,7 @@ class BaseInputGenerator(base_layer.BaseLayer):
         self._tpu_queues.append(q)
 
         if p.use_partitioned_infeed_queue:
-          input_ops = q.generate_enqueue_ops([self._batch.Flatten()])
+          input_ops = q.generate_enqueue_ops([batch.Flatten()])
         elif p.use_per_host_infeed:
           # TODO(ylc/zhifengc): Add this to a policy module and test it.
           def TPUOrdinalFunction(shard_index_in_host):
@@ -342,12 +339,12 @@ class BaseInputGenerator(base_layer.BaseLayer):
               return shard_index_in_host
 
           input_ops = q.split_inputs_and_generate_enqueue_ops(
-              self._batch.Flatten(),
+              batch.Flatten(),
               placement_function=lambda x: host_device,  # pylint: disable=cell-var-from-loop
               tpu_ordinal_function=TPUOrdinalFunction)
         else:
           input_ops = q.split_inputs_and_generate_enqueue_ops(
-              self._batch.Flatten(),
+              batch.Flatten(),
               device_assignment=py_utils.GetTpuDeviceAssignment())
         input_ops_list += input_ops
 
@@ -371,7 +368,7 @@ class BaseInputGenerator(base_layer.BaseLayer):
       # only cares about the shape/types being dequeued
       # which is why this is hard-coded to the first Queue.
       tensors = self._tpu_queues[0].generate_dequeue_op()
-    return self._batch.Pack(tensors)
+    return self._batch_nm_types.Pack(tensors)
 
   def CreateTpuEmbeddingEnqueueOps(self):
     """Creates the TpuEmbedding enqueue ops on the host.
@@ -401,24 +398,19 @@ class BaseInputGenerator(base_layer.BaseLayer):
     tf.logging.info('tpu_emb_input_keys: %r', tpu_emb_input_keys)
     if not tpu_embedding:
       return
-
+    assert len(self._per_host_batches) == num_infeed_hosts
     for task_id in range(num_infeed_hosts):
       host_device = '/task:{}/device:CPU:0'.format(task_id)
+      batch = self._per_host_batches[task_id]
       with tf.device(host_device):
-        if isinstance(self._batch, py_utils.NestedMap):
-          # Hack: bucket_keys and xxx.bucket_keys are not needed on TPU.
-          # Note that when MultiTaskData is used, bucket_keys will be at the
-          # second level of the dictionary.
-          self._batch = self._batch.FilterKeyVal(
-              lambda k, _: not k.endswith('bucket_keys'))
-        tf.logging.info('host_device: %s, batch: %r', host_device, self._batch)
+        tf.logging.info('host_device: %s, batch: %r', host_device, batch)
 
         enqueue_dict_per_core = [
             {} for _ in range(tpu_embedding.num_cores_per_host)
         ]
         num_cores_per_host = tpu_embedding.num_cores_per_host
         for key in tpu_emb_input_keys:
-          feat = self._batch[key]
+          feat = batch[key]
           tpu_emb_feat_splitted = tf.split(feat, num_cores_per_host)
           for core, split in enumerate(tpu_emb_feat_splitted):
             # Dense to sparse. Note the assumption of a padding id.
@@ -750,7 +742,6 @@ class BaseSequenceInputGenerator(BaseInputGeneratorFromFiles):
     """Defaults params for sequence input generators."""
     p = super().Params()
     p.Delete('batch_size')
-    p.remote.shardable_batch = False
 
     # How input should be bucketized.
     p.Define(
@@ -971,6 +962,198 @@ class BaseTinyDatasetInput(BaseInputGenerator):
     return raw
 
 
+class TFDataSequenceInputGenerator(BaseSequenceInputGenerator):
+  """tf.data input pipeline for sequences."""
+
+  def __init__(self, params):
+    """Constructor."""
+    if params.file_datasource:
+      raise ValueError(
+          'TFDataSequenceInputGenerator does not support p.file_datasource.')
+
+    super().__init__(params)
+
+  def _InputBatch(self):
+    """Returns a NestedMap containing an input batch."""
+    dataset = self._GetDatasetInternal()
+    dataset = self._BatchDataset(dataset)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+    batch = tf.data.make_one_shot_iterator(dataset).get_next()
+
+    # Set tensor shapes.
+    if py_utils.use_tpu():
+      # TPU requires every batch has the same size.
+      b = max(self.infeed_bucket_batch_limit)
+      assert b == min(self.infeed_bucket_batch_limit)
+    else:
+      b = None
+    for name, t in batch.FlattenItems():
+      t.set_shape((b,) + self._InputShape(name))
+
+    return batch
+
+  def _GetDatasetInternal(self):
+    return self.GetDataset()
+
+  def GetDataset(self):
+    """Loads a dataset.
+
+    Subclasses should either override this function or both of _LoadDataset()
+    and _ProcessDataset().
+
+    Returns:
+      A NestedMap containing tensors without a leading batch dimension.
+    """
+    p = self.params
+    require_sequential_order = p.require_sequential_order or self.do_eval
+
+    if isinstance(p.file_pattern, str):
+      file_patterns = p.file_pattern.split(',')
+      weights = None
+    else:
+      if not p.use_within_batch_mixing:
+        raise ValueError(
+            'Only p.use_within_batch_mixing is supported with multiple '
+            'file_patterns.')
+
+      if all([isinstance(x, str) for x in p.file_pattern]):
+        file_patterns = p.file_pattern
+        weights = None
+      elif all([isinstance(x, tuple) for x in p.file_pattern]):
+        file_patterns, weights = zip(*p.file_pattern)
+      else:
+        raise ValueError(
+            f'p.file_pattern must be all strings or all tuples, but got: '
+            f'{p.file_pattern}.')
+
+    def LoadDatasetFromSingleGlob(file_pattern_glob, source_id):
+      dataset = tf.data.Dataset.list_files(
+          file_pattern_glob,
+          shuffle=not require_sequential_order,
+          seed=p.file_random_seed)
+      num_files = len(tf.io.gfile.glob(file_pattern_glob))
+      dataset = dataset.interleave(
+          self._LoadDataset,
+          cycle_length=(1 if require_sequential_order else min(
+              num_files, p.file_parallelism)),
+          num_parallel_calls=tf.data.experimental.AUTOTUNE,
+          deterministic=require_sequential_order)
+
+      if not require_sequential_order:
+        dataset = dataset.shuffle(p.file_buffer_size)
+      if not self.do_eval:
+        dataset = dataset.repeat()
+
+      def MakeExample(*values):
+        return py_utils.NestedMap(
+            data=values[0] if len(values) == 1 else values, source_id=source_id)
+
+      dataset = dataset.map(MakeExample, **self._map_args)
+      return dataset
+
+    datasets = []
+    for i, file_pattern in enumerate(file_patterns):
+      file_pattern = py_utils.ShardedFilePatternToGlob(file_pattern)
+      datasets.append(LoadDatasetFromSingleGlob(file_pattern, i))
+    if len(file_patterns) > 1:
+      tf.logging.info(f'Mixing files {file_patterns} with weights {weights}.')
+      dataset = tf.data.experimental.sample_from_datasets(
+          datasets, weights, p.random_seed or None)
+    else:
+      dataset = datasets[0]
+
+    dataset = self._ProcessDataset(dataset)
+
+    if self.do_eval:
+      dataset = dataset.take(p.num_samples)
+
+    return dataset
+
+  def _LoadDataset(self, filename):
+    """Loads a dataset from a filename."""
+    raise NotImplementedError()
+
+  def _ProcessDataset(self, dataset):
+    """Processes a dataset returned by _LoadDataset.
+
+    Args:
+      dataset: A dataset containing NestedMaps with scalar 'data' containing the
+        value returned by _LoadDataset and scalar 'source_id' containing the
+        source id.
+
+    Returns:
+      A processed dataset containing NestedMaps of Tensors without a leading
+      batch dimension.
+    """
+    raise NotImplementedError()
+
+  def _InputShape(self, key):
+    """Returns the final shape of the tensor corresponding to key as a tuple.
+
+    The shape should not include a leading batch dimension.
+
+    Args:
+      key: The NestedMap key to return shape for.
+    """
+    if key == 'source_id':
+      return ()
+
+    raise ValueError('Unexpected key %s' % key)
+
+  def _InputPaddingValue(self, key, tensorspec):
+    """Returns the value to pad the tensor corresponding to key with."""
+    if key.endswith('_paddings'):
+      return tf.ones([], dtype=tensorspec.dtype)
+    else:
+      return tf.zeros([], dtype=tensorspec.dtype)
+
+  def _GetBucketId(self, example):
+    """Returns scalar bucket id for the example NestedMap from the dataset."""
+    raise NotImplementedError()
+
+  def _BatchDataset(self, dataset):
+    """Batches a dataset containing NestedMaps of tensors."""
+    p = self.params
+
+    def SetBucketKeys(example):
+      example.bucket_keys = self._GetBucketId(example)
+      return example
+
+    dataset = dataset.map(SetBucketKeys, **self._map_args)
+
+    dataset_structure = py_utils.NestedMap.FromNestedDict(
+        tf.data.experimental.get_structure(dataset))
+
+    padded_shapes = dataset_structure.TransformWithKey(
+        lambda k, _: tf.TensorShape(self._InputShape(k)))
+    padding_values = dataset_structure.TransformWithKey(self._InputPaddingValue)
+
+    dataset_structure.VLog(0, 'dataset_structure:')
+    padded_shapes.VLog(0, 'padded_shapes:')
+
+    dataset = dataset.apply(
+        tf.data.experimental.bucket_by_sequence_length(
+            self._GetBucketId,
+            p.bucket_upper_bound,
+            self.infeed_bucket_batch_limit + [1],
+            padded_shapes=padded_shapes,
+            padding_values=padding_values,
+            pad_to_bucket_boundary=True,
+            drop_remainder=py_utils.use_tpu()))
+
+    return dataset
+
+  @property
+  def _map_args(self):
+    """Default args for tf.data.DataSet.map()."""
+    p = self.params
+    require_sequential_order = p.require_sequential_order or self.do_eval
+    return dict(
+        num_parallel_calls=1
+        if require_sequential_order else p.num_batcher_threads,
+        deterministic=require_sequential_order)
+
+
 class BaseDataExampleInputGenerator(BaseInputGenerator):
   """Base class for input generators that read Feature protos via tf.data."""
 
@@ -992,7 +1175,6 @@ class BaseDataExampleInputGenerator(BaseInputGenerator):
         '`tf.errors.OutOfRangeError` is thrown after the limit is reached.')
     p.Define('randomize_shuffle_size', 500,
              'Size of the random shuffle buffer.')
-    p.remote.shardable_batch = False
     return p
 
   def __init__(self, params):

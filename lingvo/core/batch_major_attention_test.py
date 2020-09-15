@@ -2144,6 +2144,40 @@ class TransformerLayerTest(test_utils.TestCase, parameterized.TestCase):
     p.random_seed = 12345
     return p.Instantiate()
 
+  def _ConstructTransformerParamsTplListStack(self):
+    p = attention.StackedTransformerLayers.Params()
+    p.name = 'encoder_layers'
+    p.has_aux_atten = False
+    p.mask_self_atten = False
+    p.num_layers = 4
+    params1 = attention.TransformerLayer.Params()
+    params1.tr_atten_tpl.atten_tpl = (
+        attention.LocalSelfAttention.Params().Set(
+            left_context=2, right_context=2, block_size=4))
+    params2 = attention.TransformerLayer.Params()
+    params2.tr_atten_tpl.atten_tpl = (
+        attention.RoutingAttention.Params().Set(
+            num_clusters=1, attention_window=2))
+    p.transformer_layer_params_tpl = [params1, params2]
+    p.mdl_dim = 4
+    p.hidden_dim = 8
+    p.num_atten_heads = 2
+    p.dropout_prob = 0.2
+    p.params_init = py_utils.WeightInit.Xavier()
+    p.random_seed = 12345
+    return p.Instantiate()
+
+  def testTransformerStackTplList(self):
+    l = self._ConstructTransformerParamsTplListStack()
+    self.assertIsInstance(l.x_layers[0].self_atten.atten,
+                          attention.LocalSelfAttention)
+    self.assertIsInstance(l.x_layers[1].self_atten.atten,
+                          attention.LocalSelfAttention)
+    self.assertIsInstance(l.x_layers[2].self_atten.atten,
+                          attention.RoutingAttention)
+    self.assertIsInstance(l.x_layers[3].self_atten.atten,
+                          attention.RoutingAttention)
+
   def testStackedTransformerGetSplitForLayer(self):
     cls = attention.StackedTransformerLayers
 
@@ -2641,6 +2675,25 @@ class BuilderTest(test_utils.TestCase, parameterized.TestCase):
       tf.global_variables_initializer().run()
       actual_out = sess.run(out)
       self.assertAllClose(actual_out, 17.40516)
+
+  def testSerialization(self):
+    heads = [1, 2, 4]
+    ff_dims = [16, 32, 16]
+    atten_builder = attention.Builder.Params().Set(
+        model_dim=16, num_heads=heads, ff_hidden_dim=ff_dims).Instantiate()
+    layers = []
+    for layer_i, (head, ff_dim) in enumerate(zip(heads, ff_dims)):
+      layers.append(
+          atten_builder.TransformerEncoderLayer(
+              name='atten_{}'.format(layer_i),
+              ff_hidden_dim=ff_dim,
+              num_heads=head,
+              stride=1 if layer_i < 2 else 0))
+    p = atten_builder.Seq('model', *layers)
+
+    serialized = p.ToProto()
+    p2 = hyperparams.InstantiableParams.FromProto(serialized)
+    self.assertLen(p2.sub, len(p.sub))
 
 
 class LmBuilderTest(test_utils.TestCase):

@@ -31,41 +31,6 @@ from lingvo.core import tshape
 import numpy as np
 
 
-class ActivationsTest(test_utils.TestCase):
-
-  def testGeluActivation(self):
-    with self.session(use_gpu=True):
-      inputs = tf.constant(
-          np.linspace(-10.0, 10.0, num=21, dtype='float32'), dtype=tf.float32)
-      grads_gelu = tf.gradients(layers.Gelu(inputs), inputs)
-      grads_relu = tf.gradients(tf.nn.relu(inputs), inputs)
-
-      self.assertEqual(0.0,
-                       layers.Gelu(tf.constant(-10.0, dtype='float32')).eval())
-      self.assertEqual(0.0,
-                       layers.Gelu(tf.constant(0.0, dtype='float32')).eval())
-      self.assertEqual(10.0,
-                       layers.Gelu(tf.constant(10.0, dtype='float32')).eval())
-      actual_grads_gelu = grads_gelu[0].eval()
-      actual_grads_relu = grads_relu[0].eval()
-
-      self.assertAllClose(actual_grads_gelu[-5:], actual_grads_relu[-5:])
-      self.assertAllClose(actual_grads_gelu[:5], actual_grads_relu[:5])
-
-      # pyformat: disable
-      # pylint: disable=bad-whitespace
-      expected_grads_gelu = [
-          -7.69459925e-22, -9.25176121e-18, -4.04182472e-14, -6.39430453e-11,
-          -3.64552299e-08, -7.13557529e-06, -5.03641320e-04, -1.19456425e-02,
-          -8.52318183e-02, -8.33154917e-02,  5.00000000e-01,  1.08331549e+00,
-          1.08523178e+00,  1.01194561e+00,  1.00050366e+00,  1.00000715e+00,
-          1.00000000e+00,  1.00000000e+00,  1.00000000e+00,  1.00000000e+00,
-          1.00000000e+00]
-      # pyformat: enable
-      # pylint: enable=bad-whitespace
-      self.assertAllClose(expected_grads_gelu, actual_grads_gelu)
-
-
 class BatchNormLayerTest(test_utils.TestCase, parameterized.TestCase):
 
   def testBatchNormLayerConstruction(self):
@@ -3116,6 +3081,7 @@ class SoftmaxLayerTest(test_utils.TestCase):
                             class_probabilities=None,
                             num_samples=0,
                             default_qdomain=None,
+                            logits_qdomain=None,
                             training_step=-1,
                             seed=None,
                             dtype=tf.float32,
@@ -3156,6 +3122,8 @@ class SoftmaxLayerTest(test_utils.TestCase):
 
       if default_qdomain is not None:
         params.qdomain.default = default_qdomain
+      if logits_qdomain is not None:
+        params.qdomain.logits = logits_qdomain
 
       if num_samples > 0:
         # Turn on sampled soft-max; the asserts need to hold for it to be used.
@@ -3452,8 +3420,11 @@ class SoftmaxLayerTest(test_utils.TestCase):
     default_qdomain.cc_schedule = quant_utils.FakeQuantizationSchedule.Params(
     ).Set(
         clip_start_step=0, clip_end_step=2, quant_start_step=2)
+    logits_qdomain = default_qdomain.Copy()
     xent_loss = self._RunSimpleFullSoftmax(
-        default_qdomain=default_qdomain, training_step=5)
+        default_qdomain=default_qdomain,
+        logits_qdomain=logits_qdomain,
+        training_step=5)
     loss = xent_loss.total_xent
     log_perplexity = xent_loss.avg_xent
     print(['loss', loss])

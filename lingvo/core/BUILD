@@ -13,6 +13,31 @@ package(
 licenses(["notice"])  # Apache 2.0
 
 py_library(
+    name = "activations",
+    srcs = ["activations.py"],
+    srcs_version = "PY3",
+    deps = [
+        ":base_layer",
+        ":py_utils",
+        "//lingvo:compat",
+        "//lingvo/core:test_utils",
+    ],
+)
+
+lingvo_cuda_py_test(
+    name = "activations_test",
+    srcs = ["activations_test.py"],
+    python_version = "PY3",
+    shard_count = 5,
+    deps = [
+        ":activations",
+        ":py_utils",
+        # Implicit absl.testing.parameterized dependency.
+        "//lingvo:compat",
+    ],
+)
+
+py_library(
     name = "attention",
     srcs = ["attention.py"],
     srcs_version = "PY3",
@@ -162,6 +187,7 @@ py_library(
     srcs_version = "PY3",
     deps = [
         "//lingvo:compat",
+        "//lingvo/core:activations",
         "//lingvo/core:base_layer",
         "//lingvo/core:batch_major_attention",
         "//lingvo/core:bn_layers",
@@ -229,6 +255,7 @@ py_library(
         ":tokenizers",
         "//lingvo:compat",
         "//lingvo/core/ops",
+        # Implicit tensorflow dependency.
     ],
 )
 
@@ -425,6 +452,7 @@ py_library(
     srcs = ["builder.py"],
     srcs_version = "PY3",
     deps = [
+        ":activations",
         ":builder_layers",
         ":hyperparams",
         ":layers",
@@ -751,6 +779,7 @@ py_library(
     srcs = ["layers.py"],
     srcs_version = "PY3",
     deps = [
+        ":activations",
         ":base_layer",
         ":bn_layers",
         ":builder_layers",
@@ -806,6 +835,7 @@ py_library(
     srcs = ["conv_layers_with_time_padding.py"],
     srcs_version = "PY3",
     deps = [
+        ":activations",
         ":base_layer",
         ":bn_layers",
         ":py_utils",
@@ -820,6 +850,7 @@ py_library(
     srcs = ["conv_layers_builder.py"],
     srcs_version = "PY3",
     deps = [
+        ":activations",
         ":base_layer",
         ":builder",
         ":builder_layers",
@@ -1869,6 +1900,7 @@ py_library(
 py_library(
     name = "moe_layers",
     srcs = ["moe_layers.py"],
+    srcs_version = "PY3",
     deps = [
         ":base_layer",
         ":py_utils",

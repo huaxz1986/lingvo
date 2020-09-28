@@ -1008,8 +1008,17 @@ class LSTMCellSimpleGateDropout(LSTMCellSimple):
         'Whether to use the dropout_scale on the masked activations. If true,'
         'the activations will be multipled by 1/keep_rate, similar to the '
         'scale operation of dropout layers.')
-    p.Define('gate_mask', None, 'The mask used on the 4 gates of an LSTM cell.')
     return p
+
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
+    p = self.params
+    activation_mask_pc = py_utils.WeightParams(
+        shape=[self.hidden_size],
+        init=py_utils.WeightInit.UniformPositive(2.0, seed=p.random_seed),
+        dtype=p.dtype)
+    self.CreateVariable(
+        'activation_mask', activation_mask_pc, theta_fn=None, trainable=False)
 
   def _GatesInternal(self, theta, state0, inputs, i_i, i_g, f_g, o_g):
     """Overriding this function to use the dropout mask."""
@@ -1017,12 +1026,12 @@ class LSTMCellSimpleGateDropout(LSTMCellSimple):
     fns = self.fns
 
     # Apply the mask on the gate activations.
-    masked_tanh_i_i = tf.tanh(i_i) * p.gate_mask
-    masked_sigmoid_f_g = tf.sigmoid(f_g) * p.gate_mask
-    masked_sigmoid_o_g = tf.sigmoid(o_g) * p.gate_mask
+    masked_tanh_i_i = tf.tanh(i_i) * tf.floor(theta.activation_mask)
+    masked_sigmoid_f_g = tf.sigmoid(f_g) * tf.floor(theta.activation_mask)
+    masked_sigmoid_o_g = tf.sigmoid(o_g) * tf.floor(theta.activation_mask)
     if not p.couple_input_forget_gates:
       assert i_g is not None
-      masked_sigmoid_i_g = tf.sigmoid(i_g) * p.gate_mask
+      masked_sigmoid_i_g = tf.sigmoid(i_g) * tf.floor(theta.activation_mask)
       forget_gate = fns.qmultiply(
           masked_sigmoid_f_g, state0.c, qt='c_input_gate')
       # Sigmoid / tanh calls are not quantized under the assumption they share
@@ -1060,8 +1069,10 @@ class LSTMCellSimpleGateDropout(LSTMCellSimple):
 
     # Multiply 1/keep_rate to new_c and new_m.
     if p.use_dropout_scale:
-      new_c = new_c * self.hidden_size / tf.reduce_sum(p.gate_mask)
-      new_m = new_m * self.hidden_size / tf.reduce_sum(p.gate_mask)
+      new_c = new_c * self.hidden_size / tf.reduce_sum(
+          tf.floor(theta.activation_mask))
+      new_m = new_m * self.hidden_size / tf.reduce_sum(
+          tf.floor(theta.activation_mask))
     if p.num_hidden_nodes:
       if p.apply_pruning_to_projection:
         w_proj = self.QWeight(
@@ -1353,6 +1364,84 @@ class LayerNormalizedLSTMCellSimple(LSTMCellSimple):
       i_i, i_g, f_g, o_g = gates
     else:
       i_i, i_g, f_g, o_g = gates[0], None, gates[1], gates[2]
+    return self._GatesInternal(
+        theta=theta,
+        state0=state0,
+        inputs=inputs,
+        i_i=i_i,
+        i_g=i_g,
+        f_g=f_g,
+        o_g=o_g)
+
+
+class WeightNormalizedLSTMCellSimple(LSTMCellSimple):
+  """An implementation of weight normalized LSTM based on LSTMCellSimple.
+
+  Implements normalization scheme as described in
+  https://arxiv.org/pdf/1602.07868.pdf
+
+  theta:
+
+  - wm: the parameter weight matrix. All gates combined.
+  - b: the combined bias vector.
+
+  state:
+
+  - m: the lstm output. [batch, cell_nodes]
+  - c: the lstm cell state. [batch, cell_nodes]
+
+  inputs:
+
+  - act: a list of input activations. [batch, input_nodes]
+  - padding: the padding. [batch, 1].
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super().Params()
+    p.Define('weight_norm_epsilon', 1e-8, 'Tiny value to guard rsqr against.')
+    return p
+
+  def _CreateLayerVariables(self):
+    """Initializes LayerNormalizedLSTMCellSimple."""
+    super()._CreateLayerVariables()
+    p = self.params
+
+    add_biases = ['add_bias_{}'.format(i) for i in range(self.num_gates)]
+    self.TrackQTensor(*add_biases, domain='fullyconnected')
+
+    wn_scale_pc = py_utils.WeightParams(
+        shape=[self.num_gates * self.hidden_size],
+        init=py_utils.WeightInit.Constant(1.0),
+        dtype=p.dtype,
+        collections=self._VariableCollections())
+    self.CreateVariable('wn_scale', wn_scale_pc, self.AddGlobalVN)
+
+  def _Gates(self, xmw, theta, state0, inputs):
+    """Computes the new state."""
+
+    p = self.params
+    b = self.QWeight(tf.expand_dims(self._GetBias(theta), 0), domain='fc')
+
+    # Divide wm by it's L2 norm.
+    wm_sq_sum = tf.reduce_sum(tf.square(theta.wm), axis=0, keepdims=True)
+    normed_gates = xmw * tf.math.rsqrt(wm_sq_sum + p.weight_norm_epsilon)
+
+    gates = tf.split(normed_gates, num_or_size_splits=self.num_gates, axis=1)
+    bs = tf.split(b, num_or_size_splits=self.num_gates, axis=1)
+    wn_scales = tf.split(
+        theta.wn_scale, num_or_size_splits=self.num_gates, axis=0)
+
+    for i in range(self.num_gates):
+      # i_g is None when p.couple_input_forget_gates is True.
+      if gates[i] is not None:
+        gates[i] = gates[i] * tf.expand_dims(wn_scales[i], 0)
+        gates[i] = self.fns.qadd(gates[i], bs[i], qt='add_bias_{}'.format(i))
+
+    if not p.couple_input_forget_gates:
+      i_i, i_g, f_g, o_g = gates
+    else:
+      i_i, i_g, f_g, o_g = gates[0], None, gates[1], gates[2]
     return self._GatesInternal(theta, state0, inputs, i_i, i_g, f_g, o_g)
 
 
@@ -1429,9 +1518,8 @@ class LayerNormMaskedLSTMCellSimple(LSTMCellSimpleGateDropout):
         theta.ln_scale, num_or_size_splits=self.num_gates, axis=0)
     gates = tf.split(xmw, num_or_size_splits=self.num_gates, axis=1)
 
-    if p.gate_mask is not None:
-      assert py_utils.GetShape(p.gate_mask)[0] == self.hidden_size
-    ln_masks = tf.tile([p.gate_mask], [py_utils.GetShape(gates[0])[0], 1])
+    ln_masks = tf.tile([tf.floor(theta.activation_mask)],
+                       [py_utils.GetShape(gates[0])[0], 1])
 
     for i in range(self.num_gates):
       # i_g is None when p.couple_input_forget_gates is True.

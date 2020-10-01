@@ -1354,11 +1354,6 @@ class WeightInit:
     return WeightInit._Params('xavier', scale, seed)
 
   @staticmethod
-  def XavierGaussian(scale=1.0, seed=None):
-    """tf.random.normal(0, sqrt(2.0 / (in + out)))."""
-    return WeightInit._Params('xavier_gaussian', scale, seed)
-
-  @staticmethod
   def XavierWithFixupParams(scale=1.0,
                             depth=1.0,
                             layers_per_residual_block=1.0,
@@ -1396,6 +1391,11 @@ class WeightInit:
   def GaussianSqrtFanOut(scale=1.0, seed=None):
     """scale * tf.random.normal(0, 1 / sqrt(fan_out))."""
     return WeightInit._Params('gaussian_sqrt_fanout', scale, seed)
+
+  @staticmethod
+  def GaussianSqrtFanAvg(scale=1.0, seed=None):
+    """tf.random.normal(0, sqrt(2.0 / (in + out)))."""
+    return WeightInit._Params('gaussian_sqrt_fanavg', scale, seed)
 
   @staticmethod
   def UniformSqrtDim(scale=1.0, seed=None):
@@ -2043,14 +2043,14 @@ def _CreateVarInitStateful(name, method, shape, dim0, seed, scale, init_dtype):
     _, fan_out = GetFanInFanOut(shape)
     if fan_out is not None:
       scale *= 1.0 / math.sqrt(fan_out)
-  if method == 'xavier_gaussian':
+  if method in ['gaussian_sqrt_fanavg']:
     fan_in, fan_out = GetFanInFanOut(shape)
     if fan_in is not None and fan_out is not None:
       scale *= math.sqrt(2.0 / (fan_in + fan_out))
 
   if method in [
       'gaussian', 'gaussian_sqrt_dim', 'gaussian_sqrt_fanin',
-      'gaussian_sqrt_fanout', 'xavier_gaussian'
+      'gaussian_sqrt_fanout', 'gaussian_sqrt_fanavg'
   ]:
     v_init = init_ops.random_normal_initializer(
         mean=0.0, stddev=scale, seed=seed, dtype=init_dtype)
@@ -2282,14 +2282,14 @@ def _CreateVarInitStateless(name, method, shape, dim0, seed, scale, init_dtype):
     _, fan_out = GetFanInFanOut(shape)
     if fan_out is not None:
       scale *= 1.0 / math.sqrt(fan_out)
-  if method == 'xavier_gaussian':
+  if method in ['gaussian_sqrt_fanavg']:
     fan_in, fan_out = GetFanInFanOut(shape)
     if fan_in is not None and fan_out is not None:
       scale *= math.sqrt(2.0 / (fan_in + fan_out))
 
   if method in [
       'gaussian', 'gaussian_sqrt_dim', 'gaussian_sqrt_fanin',
-      'gaussian_sqrt_fanout', 'xavier_gaussian'
+      'gaussian_sqrt_fanout', 'gaussian_sqrt_fanavg'
   ]:
     v_init = _DeterministicRandomNormalInitializer(
         seed=seed, mean=0., stddev=scale)
@@ -3276,12 +3276,18 @@ def CombineMetrics(loss_metric_weight_pairs):
 
 
 def _AddVN(p, x, step=None):
+  """Helper method to add variational noise to weights by params."""
   assert p.vn.scale is not None
   seed = p.vn.seed
   if seed and step:
     seed += step * 203984
-  noises = tf.cast(p.vn.scale, x.dtype) * tf.random.normal(
-      tf.shape(x), stddev=1.0, seed=seed, dtype=x.dtype)
+  if p.vn.deterministic:
+    step = GetGlobalStep() if step is None else step
+    noises = DeterministicVN(
+        p, GenerateStepSeedPair(p, step), tf.shape(x), mean=0.0, std=1.0)
+  else:
+    noises = tf.random.normal(tf.shape(x), stddev=1.0, seed=seed, dtype=x.dtype)
+  noises = tf.cast(p.vn.scale, x.dtype) * noises
   return x + noises
 
 
@@ -3294,7 +3300,7 @@ def AddGlobalVN(params, weights):
 
 
 def AddPerStepVN(params, weights, step=None):
-  """Adds per-setp variational noise to weights if specified by params."""
+  """Adds per-step variational noise to weights if specified by params."""
   p = params
   if p.vn.per_step_vn:
     weights = _AddVN(p, weights, step)
@@ -3304,7 +3310,8 @@ def AddPerStepVN(params, weights, step=None):
 def VariationalNoiseParams(scale,
                            global_vn=False,
                            per_step_vn=False,
-                           seed=None):
+                           seed=None,
+                           deterministic=False):
   """Returns a hyperparams for variational noise."""
   p = hyperparams.Params()
   p.Define(
@@ -3316,11 +3323,19 @@ def VariationalNoiseParams(scale,
   p.Define('per_step_vn', per_step_vn,
            'Adds per-timesetp variational noise iff True.')
   p.Define('seed', seed, 'Random seed used to generate noise.')
+  p.Define(
+      'deterministic', deterministic, 'If true, generate noise using'
+      'stateless random ops that are compatible with TF functional ops.')
   return p
 
 
 def DefaultVN():
-  return VariationalNoiseParams(None, False, False)
+  return VariationalNoiseParams(
+      scale=None,
+      global_vn=False,
+      per_step_vn=False,
+      seed=None,
+      deterministic=False)
 
 
 # To disable VN of a layer, we use 1.0 in the first input parameter

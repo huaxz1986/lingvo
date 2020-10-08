@@ -48,7 +48,7 @@ def GetExecutorParams(model_name, cluster_params, model_registry):
   """Get the params needed to instantiate the Executor.
 
   Args:
-    model_name: A model name regsitered in the ModelRegistry.
+    model_name: A model name registered in the ModelRegistry.
     cluster_params: A cluster hyperparams object.
     model_registry: A ModelRegistry object.
 
@@ -373,7 +373,9 @@ class ExecutorTpu(base_runner.BaseRunner):
 
         done = program_schedule.Run(sess)
         if done:
-          tf.logging.info('Program schedule told us to stop.')
+          tf.logging.info('Program schedule told us to stop.\n'
+                          'Shutting down programs.')
+          program_schedule.Shutdown()
           return
 
         # global_step local variable above is a result of sess.run, not a

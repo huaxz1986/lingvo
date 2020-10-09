@@ -38,7 +38,6 @@ def Split(x,
     num_devices: xla_sharding.split arg.
     use_sharding_op: If true, adds a sharding op to set the sharding:
       tensor = gen_xla_ops.xla_sharding(tensor)
-      See http://cs/search/?q=XlaSharding+file:xla_ops.cc
 
       hyouklee@: use_sharding_op=False
         "It adds the sharding attribute to the op itself. The outcome is that,
@@ -163,8 +162,6 @@ class StateLayer(base_layer.BaseLayer):
     # FProp will  modify theta0 in-place
     state1 = state0.copy()
     state1 = StateLayer.UpdateState(dec, theta0, state1)
-
-  (see `moe_builder_test.py` for a more complete example.)
   """
   _use_flat_beam_search = False
 
@@ -223,7 +220,6 @@ class StateLayer(base_layer.BaseLayer):
 
     with tf.name_scope(p.name):
       if not self._use_flat_beam_search:
-        # For tpu_beam_search_helper
         z = tf.one_hot(t, tf.shape(state)[1])
         z = tf.expand_dims(z, 0)
         while len(z.shape) < len(x.shape):
@@ -319,7 +315,7 @@ class OverrideLayer(base_layer.BaseLayer):
   If key is not set in the global context, FProp does nothing.
   Otherwise it returns value associated to 'key'.
 
-  To override a tensor during my_layer.FProp:
+  To override a tensor during my_layer.FProp::
 
     OverrideLayer.Set(key, value)
     out_with_override = my_layer.FProp(...)
@@ -493,7 +489,7 @@ def Top2GatingOnLogits(inputs,
   1. used with xla_sharding. In this case, 'inputs' corresponds to a sharded
      tensor across multiple tpu cores. The operations within this function are
      automatically sharded/replicated across tpu cores.
-  2. used within ML-Pathways. In this case, 'inputs' is always local to one tpu
+  2. used within other projects where'inputs' is always local to one tpu
      core. All computations below are carried out on one tpu core only. This
      function tries to dispatch examples across tpu cores in such a way that
      each expert is assigned no more than 'expert_capacity_dim' number of
@@ -501,7 +497,7 @@ def Top2GatingOnLogits(inputs,
 
   Below ` indicates common way of splitting along mesh dimension.
 
-  Dimensions cheat sheet:
+  Dimensions cheat sheet::
 
     G: group_dim
     S: group_size_dim
@@ -657,7 +653,7 @@ def Top2GatingOnLogits(inputs,
     # For policy=random, it's better to nomalize gate_{1,2} before taking
     # capacity  into account and before potentially dropping second expert.
     #
-    # According to mean_xent (http://short/_NzbZ5rINr5):
+    # According to mean_xent:
     #   MoE_512_102xen_PolicyAll_298510175
     #   MoE_512_102xen_PolicyRandom_298510175
     #
@@ -684,7 +680,7 @@ def Top2GatingOnLogits(inputs,
     #   0.310606
     #   0.288229
     #
-    # Additional comparison, see mean_xent http://short/_YHccOhQtdu with
+    # Additional comparison, see mean_xent with
     # legacy_mtf_behavior=False models
     #   3 - MoE_512_102xen_PolicyAll_LegacyFalse
     #   6 - MoE_512_102xen_PolicyRandom_LegacyFalse
@@ -728,8 +724,7 @@ def Top2GatingOnLogits(inputs,
   with tf.name_scope('aux_loss'):
     # The MoE paper (https://arxiv.org/pdf/1701.06538.pdf) uses an aux loss of
     # reduce_mean(density_1_proxy * density_1_proxy). Here we replace one of
-    # the density_1_proxy with the discrete density_1 following
-    # mesh_tensorflow/transformer/moe.py?rcl=283569345.
+    # the density_1_proxy with the discrete density_1 following mesh_tensorflow.
     aux_loss = tf.reduce_mean(density_1_proxy * density_1)  # element-wise
     aux_loss *= experts_dim * experts_dim  # const coefficient
 
@@ -1218,8 +1213,6 @@ def SentenceTop2Gating(w,
   sentence-wise embedding to create dispatch and combine tensors that gate
   the entire sentence.
 
-  See SentenceTop2GatingOnLogits for more details.
-
   Note that for local_dispatch original batch BLM is reshaped into GSM, each
   group `g = 0...G-1` is being dispatched independently.
 
@@ -1308,8 +1301,6 @@ def TaskTop2Gating(w,
   Instead of using the each token, this function uses embedding_type to return a
   sentence-wise embedding to create dispatch and combine tensors that gate
   the entire sentence.
-
-  See SentenceTop2GatingOnLogits for more details.
 
   Note that for local_dispatch original batch BLM is reshaped into GSM, each
   group `g = 0...G-1` is being dispatched independently.

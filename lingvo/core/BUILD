@@ -205,6 +205,7 @@ py_test(
     srcs_version = "PY3",
     deps = [
         ":conformer_layer",
+        ":py_utils",
         # Implicit absl.testing.flagsaver dependency.
         # Implicit absl.testing.parameterized dependency.
         "//lingvo/core:bn_layers",
@@ -1915,11 +1916,13 @@ py_library(
     srcs = ["gshard_builder.py"],
     srcs_version = "PY3",
     deps = [
+        ":base_model",
         ":builder",
         ":layers",
         ":moe_layers",
         ":py_utils",
         "//lingvo:compat",
+        # Implicit numpy dependency.
     ],
 )
 
@@ -1946,6 +1949,7 @@ py_library(
         ":py_utils",
         ":tpu_summary",
         "//lingvo:compat",
+        # Implicit numpy dependency.
     ],
 )
 

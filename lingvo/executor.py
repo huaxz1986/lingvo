@@ -302,6 +302,9 @@ class ExecutorTpu(base_runner.BaseRunner):
       tf.io.write_graph(self._graph.as_graph_def(), self._checkpoint_dir,
                         'train.pbtxt')
 
+  def _GetSession(self, **kwargs):
+    return super()._GetSession(cluster_def=self._cluster_def, **kwargs)
+
   def _MaybeConstructSharedModel(self, train_cfg):
     """Construct a single shared copy of the model if this is a MultiTaskModel.
 
@@ -338,7 +341,6 @@ class ExecutorTpu(base_runner.BaseRunner):
 
   def _Loop(self):
     with self._cluster, tf.container(self._container_id), self._GetSession(
-        cluster_def=self._cluster_def,
         disable_meta_optimizer=FLAGS.disable_meta_optimizer_in_executor
     ) as sess:
       config_proto = (
@@ -357,12 +359,16 @@ class ExecutorTpu(base_runner.BaseRunner):
       sess.run(self._initialize_local_vars)
 
       sess.run(self._load_ops)
+      program_schedule = None
       while True:
         global_step = sess.run(py_utils.GetGlobalStep())
         if self._ShouldStop(sess, global_step):
           tf.logging.info('Training finished.')
           if not self._ml_perf_log:
             self.save_only_checkpointer.Save(sess, global_step)
+          if program_schedule:
+            tf.logging.info('Shutting down programs.')
+            program_schedule.Shutdown()
           return
 
         # If a task is explicitly selected, only run the programs associated

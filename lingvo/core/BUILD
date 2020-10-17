@@ -98,6 +98,7 @@ py_library(
         ":py_utils",
         ":symbolic",
         ":tshape",
+        # Implicit absl.testing.flagsaver dependency.
         "//lingvo:compat",
     ],
 )
@@ -890,7 +891,10 @@ lingvo_cuda_py_test(
     name = "conv_layers_with_time_padding_test",
     srcs = ["conv_layers_with_time_padding_test.py"],
     python_version = "PY3",
-    deps = [":layers_test_lib"],
+    deps = [
+        ":layers_test_lib",
+        # Implicit absl.testing.flagsaver dependency.
+    ],
 )
 
 py_library(
@@ -2213,5 +2217,30 @@ py_library(
         ":base_layer",
         ":py_utils",
         "//lingvo:compat",
+    ],
+)
+
+py_library(
+    name = "graddrop",
+    srcs = ["graddrop.py"],
+    srcs_version = "PY3",
+    deps = [
+        "//lingvo:compat",
+        "//lingvo/core:base_layer",
+        "//lingvo/core:py_utils",
+        "//lingvo/core:summary_utils",
+    ],
+)
+
+py_test(
+    name = "graddrop_test",
+    srcs = ["graddrop_test.py"],
+    python_version = "PY3",
+    srcs_version = "PY3",
+    deps = [
+        ":graddrop",
+        "//lingvo:compat",
+        "//lingvo/core:builder_layers",
+        "//lingvo/core:test_utils",
     ],
 )

@@ -463,9 +463,7 @@ class BaseTask(base_layer.BaseLayer):
         index.
     """
     p = self.params
-    with tf.name_scope('fprop'), tf.name_scope(
-        p.name), py_utils.GlobalStepContext(
-            tf.identity(self._global_step_var, name='global_step_tensor')):
+    with tf.name_scope('fprop'), tf.name_scope(p.name):
       # Always reset step seed at the start of a new global_step.
       py_utils.ResetStepSeed()
       metrics, per_example = self._FPropSplitInputBatch(theta, input_batch)
@@ -558,7 +556,12 @@ class BaseTask(base_layer.BaseLayer):
     tf.logging.info('BaseTask.AdjustGradients')
     return vars_gradients
 
-  def PostTrainingLoop(self):
+  def PostTrainingLoop(self, outfeed=None):
+    """Construct the post training loop op.
+
+    Args:
+      outfeed: a dict of tensors dequeued from TPU outfeed queue.
+    """
     self._post_training_loop_op = tf.group(*[
         opt.ApplyPostTrainingLoop(self._global_step_var)
         for opt in self.learners
@@ -977,7 +980,7 @@ class BaseModel(base_layer.BaseLayer):
   def ConstructFPropGraph(self):
     raise NotImplementedError('Abstract method')
 
-  def ConstructPostTrainingLoop(self):
+  def ConstructPostTrainingLoop(self, outfeed=None):
     raise NotImplementedError('Abstract method')
 
   @property
@@ -1042,8 +1045,8 @@ class SingleTaskBase(BaseModel):
   def ConstructFPropGraph(self):
     self._task.FPropDefaultTheta()
 
-  def ConstructPostTrainingLoop(self):
-    self._task.PostTrainingLoop()
+  def ConstructPostTrainingLoop(self, outfeed=None):
+    self._task.PostTrainingLoop(outfeed)
 
 
 class SingleTaskModel(SingleTaskBase):

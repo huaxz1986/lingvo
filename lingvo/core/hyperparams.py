@@ -192,15 +192,6 @@ def CopyFieldsTo(from_p, to_p, skip=None):
   return to_p
 
 
-class SerializeAsString:
-  """Classes inheriting from this will be serialized as their string repr.
-
-  This affects Params.ToProto/FromProto. An error will be raised when attempting
-  to deserialize.
-  """
-  pass
-
-
 class Params:
   """Stores data for a set of parameters.
 
@@ -454,9 +445,7 @@ class Params:
     def _ToParamValue(key, val):
       """Serializes to HyperparamValue proto."""
       param_pb = hyperparams_pb2.HyperparamValue()
-      if isinstance(val, SerializeAsString):
-        param_pb.string_repr_val = repr(val)
-      elif isinstance(val, Params):
+      if isinstance(val, Params):
         param_pb.param_val.CopyFrom(_ToParam(val, prefix=key))
       elif isinstance(val, list) or isinstance(val, range):
         # The range function is serialized by explicitely calling it.
@@ -473,7 +462,8 @@ class Params:
             val_cls).__name__ + '/' + val_cls.__name__
         param_pb.named_tuple_val.items.extend(
             [_ToParamValue(f'{key}[{k}]', v) for k, v in items])
-      elif isinstance(val, dict):
+      # Only dicts where all keys are str can be stored as dict_val.
+      elif isinstance(val, dict) and all(isinstance(k, str) for k in val):
         param_pb.dict_val.SetInParent()
         for k, v in val.items():
           param_pb.dict_val.items[k].CopyFrom(_ToParamValue(f'{key}[{k}]', v))
@@ -503,7 +493,7 @@ class Params:
         # We represent a NoneType by the absence of any of the oneof.
         pass
       else:
-        raise AttributeError(f'Unsupported: {val} for key {key}')
+        param_pb.string_repr_val = repr(val)
       return param_pb
 
     def _ToParam(val, prefix=''):
@@ -570,7 +560,7 @@ class Params:
         proto_msg.ParseFromString(param_pb.proto_val.val)
         return proto_msg
       elif which_oneof == 'string_repr_val':
-        raise TypeError('Cannot deserialize SerializeAsString instance: %s' %
+        raise TypeError('Cannot deserialize string_repr_val instance: %s' %
                         param_pb.string_repr_val)
       else:
         return getattr(param_pb, which_oneof)

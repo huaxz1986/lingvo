@@ -2634,8 +2634,8 @@ class TransformerAttentionLayer(base_layer.BaseLayer):
     # Initialize attention.
     def _LocalAttentionError(params):
       if p.is_masked and issubclass(params.cls, LocalSelfAttention):
-        tf.logging.warn('\'is_masked\' is not effective when used with '
-                        'LocalSelfAttention and its subclass(es).')
+        tf.logging.warning('\'is_masked\' is not effective when used with '
+                           'LocalSelfAttention and its subclass(es).')
 
     params = self._InitAttentionParams(p.atten_tpl)
     if isinstance(params, list):
@@ -4279,7 +4279,7 @@ class Builder(builder.Base):
             convolution_fn=None):
     """[DEPRECATED] A lightweight convolution block as described in.
 
-    Use conv_layer_builder.LConv() instead.
+    Use conv_layers_builder.LConv() instead.
 
     https://arxiv.org/abs/1901.10430
     Corresponding PyTorch Implementation (L587):

@@ -158,20 +158,17 @@ class Learner(base_layer.BaseLayer):
 
     return vmap.Filter(VariableFilter)
 
-  def ApplyPostTrainingLoop(self, global_step):
+  def ApplyPostTrainingLoop(self):
     """Applies any computation to run after each tpu trainining loop.
-
-    Args:
-      global_step: Global step variable.
 
     Returns:
       Ops to run after training loop ends.
     """
-    return self.optimizer.ApplyPostTrainingLoop(global_step)
+    return self.optimizer.ApplyPostTrainingLoop()
 
-  def LearningRate(self, step):
+  def LearningRate(self):
     p = self.params
-    lrs = self.lr_schedule.Value(step)
+    lrs = self.lr_schedule.Value()
     lrs.set_shape([])
     self._AddEvalMetric('lr_schedule', lrs, tf.constant(1.0))
     return p.learning_rate * lrs
@@ -208,7 +205,7 @@ class Learner(base_layer.BaseLayer):
     self._var_grads = var_grads
 
     assert py_utils.GetGlobalStep() is not None
-    lr = self.LearningRate(py_utils.GetGlobalStep())
+    lr = self.LearningRate()
 
     var_update_op = self.optimizer.Apply(lr, var_grads)
     return losses, var_update_op, eval_metrics

@@ -57,6 +57,11 @@ Details for older releases are unavailable.
 *   **General**
     *   py_utils.AddGlobalVN and py_utils.AddPerStepVN have been combined into
         py_utils.AddVN.
+    *   BaseSchedule().Value() no longer takes a step arg.
+    *   Classes deriving from BaseSchedule should implement Value() not FProp().
+    *   theta.global_step has been removed in favor of py_utils.GetGlobalStep().
+    *   py_utils.GenerateStepSeedPair() no longer takes a global_step arg.
+    *   PostTrainingStepUpdate() no longer takes a global_step arg.
 
 #### 0.8.2
 

@@ -1662,6 +1662,19 @@ def GenerateSeedFromName(name):
   return np.int64(int(md5.hexdigest(), 16) % (2**31 - 1))
 
 
+def MaybeGenerateSeedFromScope():
+  """Generate a random seed from the current name of the scope.
+
+  If running in eager mode, this returns 0.
+
+  Returns:
+    An integer seed in the range [0, 2**31 - 1).
+  """
+  if not tf.executing_eagerly():
+    return GenerateSeedFromName(tf.no_op(name='new_step_seed').name)
+  return 0
+
+
 def GenerateSeedFromId(obj_id):
   """Generate a random seed from the id of an object.
 
@@ -1888,6 +1901,13 @@ def _CreateVariableStateful(name,
         seed = GenerateSeedFromName(var_name)
 
   init_dtype = p.dtype.real_dtype
+
+  # TODO(b/172827074): we do not natively support var initialization for
+  # int8 type except for constant initialization.
+  # NOTE: For int8, we initialize by scaling float32 random values to integer.
+  if init_dtype == tf.int8:
+    init_dtype = tf.float32
+
   v_init = _CreateVarInitStateful(name, method, shape, dim0, seed, scale,
                                   init_dtype)
 
@@ -1906,6 +1926,23 @@ def _CreateVariableStateful(name,
       return _Wrapper
 
     v_init = ComplexWrapper(v_init)
+
+  if p.dtype == tf.int8:
+
+    def FloatToInt8Wrapper(init):
+
+      def _Wrapper(shape, dtype, partition_info):
+        del dtype
+        value = init(shape, init_dtype, partition_info)
+        scale = tf.math.maximum(
+            tf.math.reduce_min(value) / -127,
+            tf.math.reduce_max(value) / 127)
+        value = tf.divide(value, scale)
+        return tf.cast(value, tf.int8)
+
+      return _Wrapper
+
+    v_init = FloatToInt8Wrapper(v_init)
 
   # Variable creators.
   def MaybePinVarsToCpu(next_creator, **kwargs):
@@ -3472,6 +3509,25 @@ def ResetStepSeed(seed=0):
   _STEP_SEED_DICT.dict[key] = tf.convert_to_tensor(seed, dtype=tf.int64)
 
 
+def MaybeResetStepSeedFromScope():
+  """In graph mode, resets step_seed according to the current named scope.
+
+  This is used in graph mode to avoid "tensor is from a different graph"
+  errors that happen when we share random seend tensors too much.
+  See b/129159299 for more context.
+
+  Eager mode does not have this problem, so in eager mode we do nothing.
+  """
+  if not tf.executing_eagerly():
+    ResetStepSeed(GenerateSeedFromName(tf.no_op(name='new_step_seed').name))
+
+
+def MaybeResetStepSeed(seed):
+  """If we're in graph mode, reset the step seed."""
+  if not tf.executing_eagerly():
+    ResetStepSeed(seed)
+
+
 def GetIncStepSeed():
   """Returns and increments the step_seed."""
   step_seed = GetStepSeed()
@@ -4411,7 +4467,7 @@ def RematerializeFn(fn, *xs):
     `fn(*xs)`
   """
   initial_step_seed = GetStepSeed()
-  final_step_seed = GenerateSeedFromName(tf.no_op(name='new_step_seed').name)
+  final_step_seed = MaybeGenerateSeedFromScope()
 
   def Backward(fwd_xs, fwd_ys, d_fwd_ys):
     """The backward function that rematerializes forward outputs."""
@@ -4426,7 +4482,7 @@ def RematerializeFn(fn, *xs):
       dst.set_shape(src.shape)
     ResetStepSeed(initial_step_seed)
     ys = fn(*bak_xs)
-    ResetStepSeed(final_step_seed)
+    MaybeResetStepSeed(final_step_seed)
     dxs = tf.gradients(ys, bak_xs, grad_ys=d_fwd_ys)
     dxs_final = []
     for dx, x in zip(dxs, bak_xs):
@@ -4473,7 +4529,7 @@ def RematerializeFn(fn, *xs):
   # bug, which is a problem with global tensors being shared by different
   # inference graphs. It should be replaced with the new step seed value
   # returned from the Forward function when the bug is fixed.
-  ResetStepSeed(final_step_seed)
+  MaybeResetStepSeed(final_step_seed)
   return ys
 
 

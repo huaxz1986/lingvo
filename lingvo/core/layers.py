@@ -34,6 +34,7 @@ from lingvo.core import schedule
 from lingvo.core import summary_utils
 from lingvo.core import symbolic
 from lingvo.core import tshape
+from lingvo.core import xla_sharding_utils
 import numpy as np
 import sympy
 
@@ -875,14 +876,9 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
         '(b/146421936)')
     p.Define(
         'use_blocked_matmul', False, 'Whether to use blocked matrix '
-        'multiplications. This allows for weight updates to be paralellized'
-        ' across the cores for Shampoo optimizer.')
+        'multiplications. This allows for weight updates to be paralellized '
+        'across the cores for Shampoo optimizer.')
     p.Define('block_dim', 1024, 'Dimension of the block')
-    p.Define(
-        'weight_split_dims_mapping', None,
-        'Relevant only if device_mesh is not None. If not None, it is a'
-        ' list of integers (of length 2) specifying how the 2d weight'
-        ' projection matrix should be sharded over device mesh.')
     # Non-default quantization behaviour for weights.
     p.qdomain.Define('weight', None, 'Quantization domain for the weights.')
 
@@ -1151,10 +1147,7 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
     """
     p = self.params
     w = theta.w
-    if p.has_bias:
-      b = theta.b
-    else:
-      b = None
+    b = theta.b if p.has_bias else None
     if p.use_blocked_matmul:
       w = self._GetBlockedWeightMatrix(w)
       if p.weight_norm:
@@ -1240,6 +1233,9 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
 
     if b is not None:
       out += b  # NOTE: Bias on matmul is never quantized.
+    if p.device_mesh is not None:
+      out = xla_sharding_utils.MeshSplit(out, p.device_mesh,
+                                         p.activation_split_dims_mapping)
     return self._ApplyActivationFunction(out, inputs, with_activation, quant)
 
   def _ApplyActivationFunction(self,
@@ -1362,6 +1358,8 @@ class FeedForwardNet(quant_utils.QuantizableLayer):
         'weights in the projection layer.')
     p.Define('weight_split_dims_mapping_list', None,
              'A list of weight_split_dims_mapping for each sub-layer.')
+    p.Define('activation_split_dims_mapping_list', None,
+             'A list of activation_split_dims_mapping for each sub-layer.')
     # Non-default quantization behaviour for the weights.
     p.qdomain.Define('weight', None, 'Quantization domain for the weights.')
 
@@ -1409,9 +1407,14 @@ class FeedForwardNet(quant_utils.QuantizableLayer):
 
     if p.device_mesh is not None:
       weight_split_dims_mapping_list = p.weight_split_dims_mapping_list
+      activation_split_dims_mapping_list = p.activation_split_dims_mapping_list
+      if activation_split_dims_mapping_list is None:
+        activation_split_dims_mapping_list = [None] * num_layers
     else:
       weight_split_dims_mapping_list = [None] * num_layers
+      activation_split_dims_mapping_list = [None] * num_layers
     assert len(weight_split_dims_mapping_list) == num_layers
+    assert len(activation_split_dims_mapping_list) == num_layers
 
     # Residual connections work better in the form of:
     #   y = x + Affine(Activation(BatchNorm(x)))
@@ -1431,6 +1434,7 @@ class FeedForwardNet(quant_utils.QuantizableLayer):
           bn_fold_weights=p.bn_fold_weights,
           device_mesh=p.device_mesh,
           weight_split_dims_mapping=weight_split_dims_mapping_list[i],
+          activation_split_dims_mapping=activation_split_dims_mapping_list[i],
           name=name)
       params_fc_layers.append(params_i)
       in_dim = out_dim
@@ -2687,11 +2691,6 @@ class SoftmaxLayer(quant_utils.QuantizableLayer):
     p.Define(
         'chunk_size', 0, 'If non-zero, computes the per example '
         'xent by small chunks along the batch dimension.')
-    p.Define(
-        'weight_split_dims_mapping', None,
-        'Relevant only if device_mesh above is not None. If not None, it is a'
-        ' list of integers (of length 2) specifying how the 2d weight'
-        ' projection matrix should be sharded over device mesh.')
     p.qdomain.Define('logits', None, 'Quantization domain for logits.')
     p.qdomain.Define('weight', None, 'Quantization domain for the weights.')
     return p
@@ -2834,8 +2833,6 @@ class SimpleFullSoftmax(SoftmaxLayer):
     p = self.params
     assert p.name
 
-    # TODO(yonghui): add support for device_mesh in SimpleFullSoftmax.
-    assert p.device_mesh is None
     # We shard params across the class dimension.
     assert p.num_classes % p.num_shards == 0
     if not p.use_bias:
@@ -4802,7 +4799,7 @@ class GluLayer(base_layer.BaseLayer):
     return glu_output
 
 
-class MultitaskAdapterLayer(base_layer.BaseLayer):
+class MultitaskAdapterBaseLayer(base_layer.BaseLayer):
   """Residual adapter layer for multilingual models.
 
   Residual adapters can be used to fine-tune a single model to multiple
@@ -4826,16 +4823,25 @@ class MultitaskAdapterLayer(base_layer.BaseLayer):
     p.Define('bottleneck_dim', 0, 'Dimension of the bottleneck.')
     p.Define('layer_norm_tpl', LayerNorm.Params(), 'Layer norm default params.')
     p.Define(
-        'projection_params_init', None,
-        'Weight initialization for up and down projections. Only used for '
-        'weights, not biases.  If None, uses default weight init, which is '
-        'typically Xavier with scale of 1.0.')
-    p.Define(
         'data_format', 'TBC', 'String(enum) specifying the input and output '
         'data format for this layer. Supported formats: '
         '"TBC": [time, batch, input_dim] and "BTC": [batch, time, input_dim].')
     p.Define('clip_task_ids', False,
              'If True, clips the given task ids to [0, p.num_tasks - 1].')
+    return p
+
+
+class MultitaskAdapterLayer(MultitaskAdapterBaseLayer):
+  """MultitaskAdapterBaseLayer implemented with EmbeddingLayers."""
+
+  @classmethod
+  def Params(cls):
+    p = super().Params()
+    p.Define(
+        'projection_params_init', None,
+        'Weight initialization for up and down projections. Only used for '
+        'weights, not biases.  If None, uses default weight init, which is '
+        'typically Xavier with scale of 1.0.')
     return p
 
   def __init__(self, params):
@@ -4965,6 +4971,102 @@ class MultitaskAdapterLayer(base_layer.BaseLayer):
     if per_timestep_task:
       output = tf.reshape(output, inputs_shape)
     return output
+
+
+class MultitaskAdapterEinsumLayer(MultitaskAdapterBaseLayer):
+  """MultitaskAdapterBaseLayer implemented with Einsum.
+
+  The embedding-based solution sometimes triggers b/175464137.
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super().Params()
+    p.data_format = 'BTC'
+    return p
+
+  def __init__(self, params):
+    super().__init__(params)
+    p = self.params
+    assert p.data_format == 'BTC'
+    params = p.layer_norm_tpl.Copy()
+    params.input_dim = p.input_dim
+    self.CreateChild('layer_norm', params)
+
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
+    p = self.params
+    down_w_pc = py_utils.WeightParams(
+        shape=[p.num_tasks, p.input_dim, p.bottleneck_dim],
+        init=p.params_init,
+        dtype=p.dtype,
+        collections=[self.__class__.__name__ + '_vars'])
+    self.CreateVariable('down_w', down_w_pc)
+    down_b_pc = py_utils.WeightParams(
+        shape=[p.num_tasks, p.bottleneck_dim],
+        init=py_utils.WeightInit.Constant(0.),
+        dtype=p.dtype,
+        collections=[self.__class__.__name__ + '_vars'])
+    self.CreateVariable('down_b', down_b_pc)
+    up_w_pc = py_utils.WeightParams(
+        shape=[p.num_tasks, p.bottleneck_dim, p.input_dim],
+        init=p.params_init,
+        dtype=p.dtype,
+        collections=[self.__class__.__name__ + '_vars'])
+    self.CreateVariable('up_w', up_w_pc)
+    up_b_pc = py_utils.WeightParams(
+        shape=[p.num_tasks, p.input_dim],
+        init=py_utils.WeightInit.Constant(0.),
+        dtype=p.dtype,
+        collections=[self.__class__.__name__ + '_vars'])
+    self.CreateVariable('up_b', up_b_pc)
+
+  def FProp(self, theta, inputs, tasks):
+    """Fprop for multitask adapter.
+
+    Args:
+      theta: A NestedMap object containing weights' values of this layer and its
+        children layers.
+      inputs: A tensor containing the activations from the previous layer.
+        [batch, time, input_dim].
+      tasks: An int32 tensor containing the task ID for each input. [batch].
+
+    Returns:
+      A tensor containing the adapted activations with the same shape as inputs.
+    """
+    p = self.params
+    assert tasks.shape.ndims == 1
+    if p.clip_task_ids:
+      tasks = tf.clip_by_value(tasks, 0, p.num_tasks - 1)
+    # [batch, num_tasks].
+    tasks_onehot = tf.one_hot(tasks, p.num_tasks, axis=-1)
+
+    # Einsum axis names:
+    # b - batch
+    # t - time
+    # k - task
+    # i - input_dim
+    # n - bottleneck_dim
+
+    # [batch, input_dim, bottleneck_dim].
+    down_w = tf.einsum('bk,kin->bin', tasks_onehot, theta.down_w)
+    # [batch, 1, bottleneck_dim].
+    down_b = tf.einsum('bk,kn->bn', tasks_onehot, theta.down_b)[:, None, :]
+    # [batch, bottleneck_dim, input_dim].
+    up_w = tf.einsum('bk,kni->bni', tasks_onehot, theta.up_w)
+    # [batch, 1, input_dim].
+    up_b = tf.einsum('bk,ki->bi', tasks_onehot, theta.up_b)[:, None, :]
+
+    # Layer norm -> down-projection -> non-linearity -> up-projection
+    norm_inputs = self.layer_norm.FProp(theta.layer_norm, inputs)
+    # [batch, time, bottleneck_dim].
+    down_projected = tf.einsum('bti,bin->btn', norm_inputs, down_w) + down_b
+    # ReLU.
+    down_projected = tf.nn.relu(down_projected)
+    # [batch, time, input_dim].
+    up_projected = tf.einsum('btn,bni->bti', down_projected, up_w) + up_b
+    # Residual.
+    return inputs + up_projected
 
 
 class CCTGatingNetwork(quant_utils.QuantizableLayer):

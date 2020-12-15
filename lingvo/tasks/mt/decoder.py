@@ -2122,9 +2122,12 @@ class TransformerBatchMajorDecoder(MTBaseDecoder):
         'model_dim', 1024, 'Model dimension that applies to embedding '
         'layers and all Transformer layers.')
     p.Define('num_trans_layers', 6, 'Number of Transformer layers.')
-    p.Define('trans_decoder_tpl',
-             batch_major_attention.TransformerDecoderLayer.Params(),
-             'Transformer layer params.')
+    p.Define(
+        'trans_decoder_tpl',
+        batch_major_attention.TransformerDecoderLayer.Params(),
+        'Transformer layer params. This can be a list of params '
+        'of length equal to num_trans_layers or a factor of it, '
+        'in which case the params are tiled as [a, a, ..., b, b, ...]')
     p.Define('input_dropout_prob', 0.0, 'Prob at which we do input dropout.')
     p.Define('input_dropout_tpl', layers.DropoutLayer.Params(),
              'Input dropout layer params.')
@@ -2186,10 +2189,20 @@ class TransformerBatchMajorDecoder(MTBaseDecoder):
     dropout_tpl.keep_prob = (1.0 - p.input_dropout_prob)
     self.CreateChild('input_dropout', dropout_tpl)
 
-    p.trans_decoder_tpl.packed_input = p.packed_input
+    if isinstance(p.trans_decoder_tpl, list):
+      if p.num_trans_layers % len(p.trans_decoder_tpl):
+        raise ValueError('num_trans_layers should be divisible by '
+                         'len(p.trans_decoder_tpl)')
+
     params_trans_layers = []
     for i in range(p.num_trans_layers):
-      params = p.trans_decoder_tpl.Copy()
+      if isinstance(p.trans_decoder_tpl, list):
+        idx = i // len(p.trans_decoder_tpl)
+        params = p.trans_decoder_tpl[idx].Copy()
+        params.packed_input = p.packed_input
+      else:
+        params = p.trans_decoder_tpl.Copy()
+        params.packed_input = p.packed_input
       params.name = 'decoder_trans_layer_%d' % i
       params_trans_layers.append(params)
     self.CreateChildren('decoder_trans', params_trans_layers)
@@ -2353,23 +2366,26 @@ class TransformerBatchMajorDecoder(MTBaseDecoder):
     Args:
       theta: A `.NestedMap` object containing weights' values of this layer and
         its children layers.
-      encoder_outputs: A '.NestedMap' object computed by encoder. * encoded -
-        Source encoding of shape [source_time, source_batch, dim] or
-        [source_batch, source_time, dim], depending on p.input_data_format. *
-        paddings - Source encoding's padding of shape [source_time,
-        source_batch] or [source_batch, source_time].
+      encoder_outputs: A '.NestedMap' object computed by encoder.
+
+        - encoded: Source encoding of shape [source_time, source_batch, dim] or
+          [source_batch, source_time, dim], depending on p.input_data_format.
+        - paddings: Source encoding's padding of shape
+          [source_time, source_batch] or [source_batch, source_time].
       new_ids: New input ids, of shape [target_batch, 1].
       time_step: A scalar, the current decode step, 0-based.
       prefix_states: A `.NestedMap` representing the previous decoded states.
-        key   - [target_time, target_batch, num_heads, dim_per_head]. value -
-        [target_time, target_batch, num_heads, dim_per_head].
+
+        - key: [target_time, target_batch, num_heads, dim_per_head].
+        - value: [target_time, target_batch, num_heads, dim_per_head].
       use_short_seq_opt: A bool, whether using short sequence optimization.
 
     Returns:
       last_decoder_out: The last decoder layer of shape [target_batch, dim].
       updated_prefix_states: A `.NestedMap` representing the updated states.
-      key   - [target_time, target_batch, num_heads, dim_per_head].
-      value - [target_time, target_batch, num_heads, dim_per_head].
+
+        - key: [target_time, target_batch, num_heads, dim_per_head].
+        - value: [target_time, target_batch, num_heads, dim_per_head].
     """
     p = self.params
     encoder_out_bm = self._MaybeTransposeEncoderOutputs(encoder_outputs, 'BTC')
@@ -2427,11 +2443,12 @@ class TransformerBatchMajorDecoder(MTBaseDecoder):
     Args:
       theta: A `.NestedMap` object containing weights' values of this layer and
         its children layers.
-      encoder_outputs: A '.NestedMap' object computed by encoder. * encoded -
-        Source encoding of shape [source_time, source_batch, dim] or
-        [source_batch, source_time, dim], depending on p.input_data_format. *
-        paddings - Source encoding's padding of shape [source_time,
-        source_batch] or [source_batch, source_time].
+      encoder_outputs: A '.NestedMap' object computed by encoder.
+
+        - encoded: Source encoding of shape [source_time, source_batch, dim] or
+          [source_batch, source_time, dim], depending on p.input_data_format.
+        - paddings: Source encoding's padding of shape
+          [source_time, source_batch] or [source_batch, source_time].
       targets: A dict of string to tensors representing the targets one try to
         predict. Each tensor in targets is of shape [batch, target_time].
 
@@ -2645,18 +2662,20 @@ class TransformerBatchMajorDecoder(MTBaseDecoder):
     Args:
       theta: A `.NestedMap` object containing weights' values of this layer and
         its children layers.
-      encoder_outputs: A '.NestedMap' object computed by encoder. * encoded -
-        Source encoding of shape [source_time, source_batch, dim] or
-        [source_batch, source_time, dim], depending on p.input_data_format. *
-        paddings - Source encoding's padding of shape [source_time,
-        source_batch] or [source_batch, source_time].
+      encoder_outputs: A '.NestedMap' object computed by encoder.
+
+        - encoded: Source encoding of shape [source_time, source_batch, dim] or
+          [source_batch, source_time, dim], depending on p.input_data_format.
+        - paddings: Source encoding's padding of shape
+          [source_time, source_batch] or [source_batch, source_time].
       new_ids: A tensor of shape [target_batch, 1].
       states: A `.NestedMap` of tensors representing states that the clients
         would like to keep track of for each of the active hyps. prefix_states -
-        A `.NestedMap` representing the previous decoded states. key   -
-        [target_time, target_batch, num_heads, dim_per_head]. value -
-        [target_time, target_batch, num_heads, dim_per_head]. time_step - A
-        scalar, the current decode step, 0-based.
+        A `.NestedMap` representing the previous decoded states.
+
+          - key: [target_time, target_batch, num_heads, dim_per_head].
+          - value: [target_time, target_batch, num_heads, dim_per_head].
+          - time_step: A scalar, the current decode step, 0-based.
       num_hyps_per_beam: A scalar, beam size.
       use_short_seq_opt: A bool, whether using short sequence optimization.
 

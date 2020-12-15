@@ -306,6 +306,9 @@ class MultiHeadedAttention(base_layer.BaseLayer):
     p.Define('input_dim', 0, 'Number of key nodes.')
     p.Define('hidden_dim', 0, 'Number of hidden nodes.')
     p.Define('num_heads', 1, 'Num of attention heads.')
+    p.Define(
+        'dim_per_head', None, 'Hidden dim of each attention head. If None, '
+        'defaults to p.hidden_dim // p.num_heads')
     p.Define('dropout_tpl', layers.DropoutLayer.Params(),
              'Params for dropout layer.')
     p.Define(
@@ -337,7 +340,7 @@ class MultiHeadedAttention(base_layer.BaseLayer):
     assert p.hidden_dim, 'hidden_dim is {}'.format(p.hidden_dim)
     # if proj_tpl does not have dim_per_head set, set it
     if p.proj_tpl.dim_per_head == 0:
-      dim_per_head = p.hidden_dim // p.num_heads
+      dim_per_head = p.dim_per_head or p.hidden_dim // p.num_heads
       p.proj_tpl.dim_per_head = dim_per_head
 
     if p.device_mesh is not None:
@@ -1225,7 +1228,7 @@ class MultiHeadedAttentionRPE(MultiHeadedAttention):
 
 
 class LocalSelfAttention(MultiHeadedAttention):
-  """Dot-product causal self attention using a sliding window.
+  """Dot-product self attention using a sliding window.
 
   We use the following capital letters to denote certain
   tensor parameters.
@@ -1241,6 +1244,13 @@ class LocalSelfAttention(MultiHeadedAttention):
     F = L + R = context size of one position.
     C = L + R + W - 1 = context size of a block of W positions.
     U = ceiling(T/W).
+
+  For each position, its attention range includes from the left
+  L-1 tokens before it (up to the beginning of the sequence),
+  the self, and the right R tokens after it (up to the end of the
+  sequence). This is not affected by the block size.
+
+  Causality is enabled when right context size R=0.
 
   The key difference to base class is on calculating logits:
     Base class:
@@ -1273,6 +1283,12 @@ class LocalSelfAttention(MultiHeadedAttention):
         'left_context', None, 'Number of left positions to attend '
         '(including current position).')
     p.Define('right_context', 0, 'Number of right positions to attend.')
+    p.Define(
+        'force_consistent_probs_shape', False,
+        'Bool, whether to force the attention_probs tensor returned from '
+        'FProp() to have shape [B N T S] to be consistent with the MHA '
+        'parent class. Default returns a custom rank-5 tensor with '
+        'shape [B, N, U, W, C].')
 
     # The following are for streaming inference only.
     p.Define(
@@ -1458,7 +1474,7 @@ class LocalSelfAttention(MultiHeadedAttention):
     value_vec = py_utils.HasShape(value_vec, [b, t, d])
     key_vec = py_utils.HasShape(key_vec, [b, t, d])
     paddings = py_utils.HasShape(paddings, [b, t])
-    return super().FProp(
+    encoded, probs = super().FProp(
         theta,
         query_vec,
         key_vec,
@@ -1466,6 +1482,31 @@ class LocalSelfAttention(MultiHeadedAttention):
         paddings,
         segment_mask=segment_mask,
         per_step_padding=per_step_padding)
+    p = self.params
+    if not p.force_consistent_probs_shape:
+      return encoded, probs
+
+    # We turn 'probs' into shape [B, N, T, S] before turning it.
+    # probs has shape [B N U W C].
+    _, n, u, w, _ = py_utils.GetShape(probs, 5)
+    # shape [B N W U C]
+    probs = tf.transpose(probs, [0, 1, 3, 2, 4])
+    # Maximum length needed to keep track of probs along the T axis.
+    m = t + p.left_context - 1 + p.right_context
+    # shape [B N W U M+W], where M = (L-1) + T + R
+    probs = py_utils.PadOrTrimTo(probs, [b, n, w, u, m + w])
+    probs = tf.reshape(probs, [b, n, w, u * (m + w)])
+    # Now each row is shifted by W from its previous row. This recovers
+    # the true position of the C axis into the now expanded T axis.
+    probs = tf.reshape(probs[:, :, :, :u * m], [b, n, w, u, m])
+    # Shape [B N U W M]
+    probs = tf.transpose(probs, [0, 1, 3, 2, 4])
+    # Shape [B N U W T]
+    probs = probs[:, :, :, :, p.left_context - 1:m - p.right_context]
+    probs = tf.reshape(probs, [b, n, w * u, t])
+    # Truncate to shape [B N T T]
+    probs = probs[:, :, :t, :]
+    return encoded, probs
 
   def ExtendStep(self,
                  theta,
@@ -2045,7 +2086,6 @@ class RoutingAttention(MultiHeadedAttention):
     * supporting packed inputs;
     * support attention dropout;
     * support relative position encoding;
-    * support using local attention on some heads.
 
   We use the following capital letters to denote shape parameters:
     B = batch size
@@ -2097,7 +2137,7 @@ class RoutingAttention(MultiHeadedAttention):
     clustering_p = p.clustering
     clustering_p.num_clusters = p.num_clusters
     clustering_p.num_heads = p.num_heads
-    clustering_p.dim_per_head = p.hidden_dim // p.num_heads
+    clustering_p.dim_per_head = p.dim_per_head or p.hidden_dim // p.num_heads
     # We normalize manually prior so that we can reuse the same normalized
     # query/key to compute attention probs later.
     clustering_p.apply_layer_norm = False
@@ -2141,7 +2181,7 @@ class RoutingAttention(MultiHeadedAttention):
 
     Returns:
       encoded: [B, T, N, H].
-      atten_probs: [B, T, N, S].
+      atten_probs: [B, N, T, S].
     """
     p = self.params
     if segment_mask is not None or per_step_padding is not None:
@@ -2169,11 +2209,16 @@ class RoutingAttention(MultiHeadedAttention):
       k_dists, _ = self.clustering.FProp(
           theta.clustering, key, key_paddings, update=update)
     if p.fast_path:
-      return self._DotAttenFastPath(theta, query, key, value, q_dists, k_dists,
-                                    query_paddings, key_paddings)
+      encoded, probs = self._DotAttenFastPath(theta, query, key, value, q_dists,
+                                              k_dists, query_paddings,
+                                              key_paddings)
     else:
-      return self._DotAttenSlowPath(theta, query, key, value, q_dists, k_dists,
-                                    query_paddings, key_paddings)
+      encoded, probs = self._DotAttenSlowPath(theta, query, key, value, q_dists,
+                                              k_dists, query_paddings,
+                                              key_paddings)
+    # 'probs' has shape [B, T, N, S]
+    atten_probs = tf.transpose(probs, perm=[0, 2, 1, 3])
+    return encoded, atten_probs
 
   def InitStates(self, theta, target_batch_size, target_max_length):
     """Initialize 'states' with .key, .value, and .key_dists."""
@@ -2446,9 +2491,9 @@ class RoutingAttention(MultiHeadedAttention):
 
     q_length = py_utils.GetShape(query, 2)[1]
     k_length = py_utils.GetShape(key, 2)[1]
-    assert isinstance(q_length, int)
-    assert isinstance(k_length, int)
-    q_cluster_size = int(p.query_group_size_factor * q_length / p.num_clusters)
+    q_cluster_size = tf.cast(
+        p.query_group_size_factor / p.num_clusters *
+        tf.cast(q_length, py_utils.FPropDtype(p)), tf.int32)
     # Of shape [B, N, K, T]
     q_dists = tf.transpose(q_dists, [0, 2, 3, 1])
     # closest_q of shape [B, N, K, V], where V = q_cluster_size
@@ -2504,7 +2549,7 @@ class RoutingAttention(MultiHeadedAttention):
           is_key_padded, tf.math.greater(c_key_positions, c_query_positions))
 
     logits = tf.einsum('BNKVD,BNKWD->BNKVW', c_query, c_key)
-    logits *= tf.math.rsqrt(tf.cast(dim_per_head, p.dtype))
+    logits *= tf.math.rsqrt(tf.cast(dim_per_head, py_utils.FPropDtype(p)))
 
     very_negative_logits = (
         tf.ones_like(logits) * logits.dtype.max *
@@ -2586,7 +2631,7 @@ class RoutingAttention(MultiHeadedAttention):
       times = tf.scatter_nd(
           times_idx, tf.cast(tf.ones_like(closest_q), scattered_prob.dtype),
           [B, q_length, N])
-      times = tf.maximum(1.0, times[:, :, :, None])
+      times = tf.maximum(tf.cast(1.0, times.dtype), times[:, :, :, None])
       out = scattered_prob / times
       return out
 
@@ -2830,17 +2875,13 @@ class TransformerAttentionLayer(base_layer.BaseLayer):
     """Returns an initialized transformer attention parameters."""
     p = self.params
 
-    # Make sure atten_tpl and num_heads are scalars or lists of same size
-    def _RaiseTypeError():
+    if isinstance(p.num_heads, list) != isinstance(atten_tpl, list):
+      raise ValueError('p.num_heads and p.atten_tpl should both be lists '
+                       f'or both scalars for {p.name} num_heads={p.num_heads}.')
+    if isinstance(p.num_heads, list) and (len(p.num_heads) != len(atten_tpl)):
       raise ValueError('num_heads and atten_tpl should both be lists '
-                       'of the same size or both scalars.')
-
-    if isinstance(p.num_heads, list) == isinstance(atten_tpl, list):
-      if isinstance(p.num_heads, list):
-        if len(p.num_heads) != len(atten_tpl):
-          _RaiseTypeError()
-    else:
-      _RaiseTypeError()
+                       'of the equal sizes: '
+                       f'{len(p.num_heads)} vs {len(atten_tpl)}')
 
     def _SetCommonParams(params, name, num_heads):
       params.name = name
@@ -3296,7 +3337,7 @@ class TransformerLayer(base_layer.BaseLayer):
     params.name = 'multihead_self_atten'
     params.input_dim = p.input_dim
     params.is_masked = p.mask_self_atten
-    if p.num_heads:
+    if p.num_heads and not isinstance(params.num_heads, list):
       params.num_heads = p.num_heads
     if isinstance(params.atten_tpl, list):
       for atten in params.atten_tpl:
@@ -3310,7 +3351,7 @@ class TransformerLayer(base_layer.BaseLayer):
       params = p.tr_atten_tpl.Copy()
       params.name = 'multihead_cross_atten'
       params.input_dim = p.input_dim
-      if p.num_heads:
+      if p.num_heads and not isinstance(params.num_heads, list):
         params.num_heads = p.num_heads
       if isinstance(params.atten_tpl, list):
         for atten in params.atten_tpl:
@@ -3739,7 +3780,8 @@ class StackedTransformerLayers(base_layer.BaseLayer):
       p_ii.input_dim = p.mdl_dim
       p_ii.output_dim = p.mdl_dim
       p_ii.packed_input = p.packed_input
-      p_ii.tr_atten_tpl.num_heads = p.num_atten_heads
+      if not isinstance(p_ii.tr_atten_tpl.num_heads, list):
+        p_ii.tr_atten_tpl.num_heads = p.num_atten_heads
       p_ii.tr_atten_tpl.atten_dropout_prob = p.dropout_prob
       p_ii.tr_atten_tpl.residual_dropout_prob = p.dropout_prob
       p_ii.tr_atten_tpl.add_unnormalized_input = p.add_unnormalized_input
@@ -3912,145 +3954,6 @@ class TransformerFeedForwardLayerWithTaskId(
     return h
 
 
-# TODO(ankurbpn,huangyp): Remove this layer.
-class GPipeTransformerLayer(TransformerLayer):
-  """GPipe compatible transformer layer.
-
-  DEPRECATED: This layer and its use in GPipeTransformerStack is
-  deprecated. Consider using the new GPipeBatchMajorTransformerStack instead.
-  """
-
-  @classmethod
-  def Params(cls):
-    p = super().Params()
-    p.tr_fflayer_tpl = TransformerFeedForwardLayerWithTaskId.Params()
-    return p
-
-  def FProp(self,
-            theta,
-            source_vecs,
-            source_paddings,
-            target_vecs,
-            target_paddings,
-            source_segment_id,
-            target_segment_id,
-            transparent_acc,
-            transparent_acc_helper,
-            source_task_id=None,
-            target_task_id=None):
-    p = self.params
-    with tf.name_scope(p.name):
-      if p.has_aux_atten:  # Decoder FProp
-        seg_mask = SegmentMask(target_segment_id, target_segment_id)
-        aux_seg_mask = SegmentMask(target_segment_id, source_segment_id)
-        atten_vec, _ = self.self_atten.FProp(
-            theta.self_atten,
-            target_vecs,
-            None,
-            target_paddings,
-            segment_mask=seg_mask)
-        atten_vec, _ = self.cross_atten.FProp(
-            theta.cross_atten,
-            atten_vec,
-            source_vecs,
-            source_paddings,
-            segment_mask=aux_seg_mask)
-        atten_vec = self.fflayer.FProp(theta.fflayer, atten_vec,
-                                       target_paddings, target_task_id)
-        atten_vec.set_shape(target_vecs.shape)
-        return (source_vecs, source_paddings, atten_vec, target_paddings,
-                source_segment_id, target_segment_id, transparent_acc,
-                transparent_acc_helper, source_task_id, target_task_id)
-      # Encoder FProp
-      seg_mask = SegmentMask(source_segment_id, source_segment_id)
-      atten_vec, _ = self.self_atten.FProp(
-          theta.self_atten,
-          source_vecs,
-          None,
-          source_paddings,
-          segment_mask=seg_mask)
-      atten_vec = self.fflayer.FProp(theta.fflayer, atten_vec, source_paddings,
-                                     source_task_id)
-      atten_vec.set_shape(source_vecs.shape)
-
-      return (atten_vec, source_paddings, target_vecs, target_paddings,
-              source_segment_id, target_segment_id, transparent_acc,
-              transparent_acc_helper, source_task_id, target_task_id)
-
-  @classmethod
-  def FPropMeta(cls, p, inputs, *args):
-    py_utils.CheckShapes((inputs,))
-    flops_per_element = 5
-    source_batch, src_time, dim = inputs
-    flops = flops_per_element * src_time * src_time * source_batch * dim
-    args = args if isinstance(args, tuple) else (args,)
-    return py_utils.NestedMap(flops=flops, out_shapes=(inputs,) + args)
-
-  @classmethod
-  def SetupDeterministicDropout(cls, params):
-    """Replaced dropout layers in transformer with deterministic ones."""
-    params.tr_atten_tpl.dropout_tpl = (
-        layers.DeterministicDropoutLayer.Params())
-    params.tr_atten_tpl.atten_tpl.dropout_tpl = (
-        layers.DeterministicDropoutLayer.Params())
-    params.tr_fflayer_tpl.residual_dropout_tpl = (
-        layers.DeterministicDropoutLayer.Params())
-    params.tr_fflayer_tpl.fflayer_tpl.dropout = (
-        layers.DeterministicDropoutLayer.Params())
-    return params
-
-  def ExtendStep(self,
-                 theta,
-                 query_vec,
-                 aux_vec,
-                 aux_paddings,
-                 cached_states,
-                 time_step,
-                 task_id=None,
-                 use_short_seq_opt=False):
-    """Transformer decoder layer, extend one step in autoregressive decoding.
-
-    Args:
-      theta: A `.NestedMap` object containing weights' values of this layer and
-        its children layers.
-      query_vec:    [target_batch, 1, dim].
-      aux_vec:      [source_batch, source_time, dim]
-      aux_paddings: [source_batch, source_time]
-      cached_states: A `.NestedMap` object containing tensors which are the
-        results of previous attentions, used for fast decoding. key   -
-        [target_time, target_batch, num_heads, dim_per_head]. value -
-        [target_time, target_batch, num_heads, dim_per_head].
-      time_step: A scalar, the current decode step, 0-based.
-      task_id: [batch_size]: the input task_id meta information.
-      use_short_seq_opt: A bool, whether using short sequence optimization.
-
-    Returns:
-      cur_output: [target_batch, 1, dim]
-      updated_states: A `.NestedMap` object containing the updated states.
-      key   - [target_time, target_batch, num_heads, dim_per_head].
-      value - [target_time, target_batch, num_heads, dim_per_head].
-    """
-    target_batch, _, dim = py_utils.GetShape(query_vec, 3)
-    source_batch = py_utils.GetShape(aux_vec)[0]
-
-    # First the self-attention layer.
-    atten_vec, updated_states = self.self_atten.ExtendStep(
-        theta.self_atten, query_vec, cached_states, time_step,
-        use_short_seq_opt)
-
-    # Next the cross-attention layer.
-    atten_vec = tf.reshape(atten_vec, [source_batch, -1, dim])
-    atten_vec, _ = self.cross_atten.FProp(theta.cross_atten, atten_vec, aux_vec,
-                                          aux_paddings)
-    atten_vec = tf.reshape(atten_vec, [target_batch, 1, -1])
-
-    # Finally the feed-forward layer.
-    cur_output = self.fflayer.FProp(
-        theta.fflayer, atten_vec,
-        tf.zeros([target_batch, 1], dtype=atten_vec.dtype), task_id)
-    return cur_output, updated_states
-
-
 class GPipeBatchMajorTransformerLayer(TransformerLayer):
   """GPipe compatible batch majortransformer layer.
 
@@ -4193,10 +4096,13 @@ class GPipeBatchMajorTransformerLayer(TransformerLayer):
         use_short_seq_opt)
 
     # Next the cross-attention layer.
-    atten_vec = tf.reshape(atten_vec, [source_batch, -1, dim])
-    atten_vec, _ = self.cross_atten.FProp(theta.cross_atten, atten_vec, aux_vec,
-                                          aux_paddings)
-    atten_vec = tf.reshape(atten_vec, [target_batch, 1, -1])
+    if self.params.has_aux_atten:  # Decoder FProp
+      atten_vec = tf.reshape(atten_vec, [source_batch, -1, dim])
+      atten_vec, cross_atten_probs = self.cross_atten.FProp(
+          theta.cross_atten, atten_vec, aux_vec, aux_paddings)
+      atten_vec = tf.reshape(atten_vec, [target_batch, 1, -1])
+    else:
+      cross_atten_probs = None
 
     # Finally the feed-forward layer.
     cur_output = self.fflayer.FProp(
@@ -4205,7 +4111,7 @@ class GPipeBatchMajorTransformerLayer(TransformerLayer):
 
     if self.params.output_layer_norm:
       cur_output = self.layer_norm.FProp(theta.layer_norm, cur_output)
-    return cur_output, updated_states
+    return cur_output, cross_atten_probs, updated_states
 
 
 class ResidualAddLayer(base_layer.BaseLayer):

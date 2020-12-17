@@ -3480,7 +3480,9 @@ class TransformerLayer(base_layer.BaseLayer):
                  aux_paddings,
                  cached_states,
                  time_step,
-                 use_short_seq_opt=False):
+                 use_short_seq_opt=False,
+                 *,
+                 compute_atten_probs=False):
     """Transformer decoder layer, extend one step in autoregressive decoding.
 
     query_vec and aux_* may have different batch sizes, e.g., during a beam
@@ -3505,11 +3507,15 @@ class TransformerLayer(base_layer.BaseLayer):
         [target_time, target_batch, num_heads, dim_per_head].
       time_step: A scalar, the current decode step, 0-based.
       use_short_seq_opt: A bool, whether using short sequence optimization.
+      compute_atten_probs: A bool, whether attention probabilities should be
+        computed. If false, returns None for atten_probs.
 
     Returns:
-      cur_output: [target_batch, 1, dim]
-      atten_probs: [target_batch, num_heads, target_time=1, source_time]
-      updated_states: A `.NestedMap` object containing the updated states.
+      (cur_output, atten_probs, updated_states)
+      * cur_output: [target_batch, 1, dim]
+      * atten_probs: [target_batch, num_heads, target_time=1, source_time] if
+      compute_atten_probs is True and p.has_aux_atten=True. None otherwise.
+      * updated_states: A `.NestedMap` object containing the updated states.
       key   - [target_time, target_batch, num_heads, dim_per_head].
       value - [target_time, target_batch, num_heads, dim_per_head].
     """
@@ -3521,27 +3527,27 @@ class TransformerLayer(base_layer.BaseLayer):
         theta.self_atten, query_vec, cached_states, time_step,
         use_short_seq_opt)
     atten_vec = py_utils.HasShape(atten_vec, [target_batch, 1, dim])
+    cross_atten_probs = None
     if self.params.has_aux_atten:
       source_batch = self._GetSourceBatchSize(aux_vec)
       source_length = self._GetSourceLength(aux_vec)
       batch_multiplier = target_batch // source_batch
       # Next the cross-attention layer.
       atten_vec = tf.reshape(atten_vec, [source_batch, -1, dim])
-      atten_vec, cross_atten_probs = self.cross_atten.FProp(
+      atten_vec, aux_atten_probs = self.cross_atten.FProp(
           theta.cross_atten, atten_vec, aux_vec, aux_paddings)
-      cross_atten_probs = py_utils.HasShape(
-          cross_atten_probs,
-          # [source_batch, num_heads, batch_multiplier, source_length].
-          [source_batch, -1, batch_multiplier, source_length])
-      _, num_heads, _, _ = py_utils.GetShape(cross_atten_probs)
-      # [source_batch, batch_multiplier, num_heads, source_length].
-      cross_atten_probs = tf.transpose(cross_atten_probs, [0, 2, 1, 3])
-      # Reshape to [target_batch, num_heads, 1, source_length].
-      cross_atten_probs = tf.reshape(
-          cross_atten_probs, [target_batch, num_heads, 1, source_length])
       atten_vec = tf.reshape(atten_vec, [target_batch, 1, -1])
-    else:
-      cross_atten_probs = None
+      if compute_atten_probs:
+        cross_atten_probs = py_utils.HasShape(
+            aux_atten_probs,
+            # [source_batch, num_heads, batch_multiplier, source_length].
+            [source_batch, -1, batch_multiplier, source_length])
+        _, num_heads, _, _ = py_utils.GetShape(cross_atten_probs)
+        # [source_batch, batch_multiplier, num_heads, source_length].
+        cross_atten_probs = tf.transpose(cross_atten_probs, [0, 2, 1, 3])
+        # Reshape to [target_batch, num_heads, 1, source_length].
+        cross_atten_probs = tf.reshape(
+            cross_atten_probs, [target_batch, num_heads, 1, source_length])
 
     # Finally the feed-forward layer.
     cur_output = self.fflayer.FProp(
@@ -4903,7 +4909,8 @@ class Builder(builder.Base):
       name: name of this layer.
       stride: If omitted, the default is 1: use every token in the query. To use
         every k-th token, set the stride to k. When set to 0, only use the first
-        token of the query.
+        token of the query. When packed_input is true, need to make sure that
+        each segment has length divisible by stride.
       first_n: only considers the first N tokens for the output. We use
         [:first_n:stride] to select the output tokens. If first_n is None, this
         flag is a no-op. If stride is positive, the output sequence length is
@@ -4922,6 +4929,10 @@ class Builder(builder.Base):
     attention_inputs = 'strided_query,after_ln,after_ln,i.paddings'
     sub_list = []
     if p.packed_input:
+      if stride > 1:
+        # TODO(huangyp): Make sure striding won't cross segment boundaries.
+        tf.logging.warning('Each segment in the packed input should has length '
+                           'divisible by stride.')
       sub_list += [
           ('i.segment_mask->strided_segment_mask',
            self._Stride('segment_mask_query_stride', stride, first_n, axis=2)),
@@ -4984,15 +4995,15 @@ class Builder(builder.Base):
 
     Args:
       name: name of this layer.
-      stride: If omitted, the default is 1: use every token in the query. To use
-        every k-th token, set the stride to k. When set to 0, only use the first
-        token of the query.
-      first_n: only considers the first N tokens for the output. We use
-        [:first_n:stride] to select the output tokens. If first_n is None, this
-        flag is a no-op. If stride is positive, the output sequence length is
-        "(first_n-1) // stride + 1". If stride is 0, first_n has to be None or
-        1. first_n can't be 0. If first_n <= stride, only the first token is
-        used.
+      stride: If omitted, the default is 1: use every token in the query. To
+        pool every k-th token, set the stride to k. When set to 0, only use the
+        first token of the query. When packed_input is true, need to make sure
+        that each segment has length divisible by stride.
+      first_n: only considers the first N tokens for the output.If first_n is
+        None, this flag is a no-op. If stride is positive, the output sequence
+        length is  "(first_n-1) // stride + 1". If stride is 0, first_n has to
+        be None or 1. first_n can't be 0. If first_n <= stride, only the first
+        token is used.
       num_heads: the number of heads.
 
     Returns:
@@ -5014,8 +5025,19 @@ class Builder(builder.Base):
 
     if num_heads is None:
       num_heads = p.num_heads
-
-    sub_list = [
+    sub_list = []
+    if p.packed_input:
+      if stride > 1:
+        assert p.funnel_pool_tpl.begin_intact == 0
+        # TODO(huangyp): Make sure striding won't cross segment boundaries.
+        tf.logging.warning('Each segment in the packed input should has length '
+                           'divisible by stride.')
+      sub_list += [
+          ('i.segment_mask->strided_segment_mask',
+           self._Stride('segment_mask_query_stride', stride, first_n, axis=2)),
+      ]
+      attention_inputs += ',strided_segment_mask'
+    sub_list += [
         ('i.vec->after_ln',
          self._DefaultLN('LN')),
         ('after_ln->strided_query',
@@ -5031,6 +5053,11 @@ class Builder(builder.Base):
         ('i.paddings->o.paddings',
          self._Pool('padding_after_Stride', stride, first_n)),
     ]
+    if p.packed_input:
+      sub_list += [
+          ('strided_segment_mask->o.segment_mask',
+           self._Stride('segment_mask_context_stride', stride, first_n, axis=3)),
+      ]
 
     return self._Graph(
         name,
@@ -5064,8 +5091,6 @@ class Builder(builder.Base):
       A transformer encoder layer params that supports optional stride.
     """
     p = self.params
-    if p.packed_input:
-      raise ValueError('FunnelEncoderLayer does not support packed input.')
     if ff_hidden_dim is None:
       ff_hidden_dim = p.ff_hidden_dim
     if num_heads is None:

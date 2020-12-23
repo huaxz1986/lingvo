@@ -90,6 +90,7 @@ py_library(
         ":base_layer",
         ":builder",
         ":conv_layers_builder",
+        ":favor_attention",
         ":gpipe",
         ":hyperparams",
         ":layers",
@@ -98,6 +99,7 @@ py_library(
         ":py_utils",
         ":symbolic",
         ":tshape",
+        # Implicit absl.logging dependency.
         "//lingvo:compat",
     ],
 )
@@ -195,6 +197,7 @@ py_library(
         "//lingvo/core:batch_major_attention",
         "//lingvo/core:bn_layers",
         "//lingvo/core:conv_layers_with_time_padding",
+        "//lingvo/core:gshard_builder",
         "//lingvo/core:layers",
         "//lingvo/core:layers_with_attention",
         "//lingvo/core:moe_layers",
@@ -213,6 +216,7 @@ py_test(
         # Implicit absl.testing.flagsaver dependency.
         # Implicit absl.testing.parameterized dependency.
         "//lingvo/core:bn_layers",
+        "//lingvo/core:gshard_builder",
         "//lingvo/core:test_utils",
     ],
 )
@@ -340,6 +344,32 @@ py_test(
         ":py_utils",
         ":test_utils",
         "//lingvo:compat",
+    ],
+)
+
+py_library(
+    name = "favor_attention",
+    srcs = ["favor_attention.py"],
+    srcs_version = "PY3",
+    deps = [
+        "//lingvo:compat",
+    ],
+)
+
+py_test(
+    name = "favor_attention_test",
+    size = "medium",
+    srcs = [
+        "favor_attention_test.py",
+    ],
+    python_version = "PY3",
+    deps = [
+        ":favor_attention",
+        ":test_utils",
+        # Implicit absl.logging dependency.
+        # Implicit absl.testing.parameterized dependency.
+        "//lingvo:compat",
+        # Implicit numpy dependency.
     ],
 )
 

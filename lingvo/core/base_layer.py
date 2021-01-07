@@ -24,9 +24,9 @@ import itertools
 import re
 import lingvo.compat as tf
 from lingvo.core import cluster_factory
+from lingvo.core import gshard_utils
 from lingvo.core import hyperparams
 from lingvo.core import py_utils
-from lingvo.core import xla_sharding_utils
 
 FLAGS = tf.flags.FLAGS
 
@@ -747,6 +747,11 @@ class BaseLayer(tf.Module, metaclass=BaseLayerMeta):
         (tf.Tensor) -> (tf.Tensor).
       **kwargs: Keyword args passed to `.py_utils.CreateVariable`.
     """
+    if self.params.device_mesh is not None:
+      if (len([dim for dim in var_params.shape if dim > 1]) > 1 and
+          var_params.tensor_split_dims_mapping is None):
+        tf.logging.warn('tensor_split_dims_mapping missing for %s.%s: shape=%s',
+                        self.path, name, var_params.shape)
     if self._is_variable_free:
       raise ValueError('Cannot create variable in variable free layer.')
     if self._create_variables_status == _CreateLayerVariablesStatus.COMPLETED:
@@ -801,7 +806,7 @@ class BaseLayer(tf.Module, metaclass=BaseLayerMeta):
     # Due to b/174956514, we have to annotate the use of the variable once,
     # otherwise, the sharding annotation on the var will be ignored.
     # TODO(yonghui): Get rid of this once b/174956514 is fixed.
-    value = xla_sharding_utils.MeshSplit(
+    value = gshard_utils.MeshSplit(
         value,
         meta.var_params.device_mesh,
         meta.var_params.tensor_split_dims_mapping,

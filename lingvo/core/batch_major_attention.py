@@ -32,14 +32,14 @@ from lingvo.core import computation_cost
 from lingvo.core import conv_layers_builder as conv_layers
 from lingvo.core import favor_attention as favor
 from lingvo.core import gpipe
+from lingvo.core import gshard_layers
+from lingvo.core import gshard_utils
 from lingvo.core import hyperparams
 from lingvo.core import layers
 from lingvo.core import layers_with_attention
-from lingvo.core import moe_layers
 from lingvo.core import py_utils
 from lingvo.core import symbolic
 from lingvo.core import tshape
-from lingvo.core import xla_sharding_utils
 import numpy as np
 # pylint: disable=g-direct-tensorflow-import
 from tensorflow.python.ops import inplace_ops
@@ -368,6 +368,7 @@ class MultiHeadedAttention(base_layer.BaseLayer):
 
     if p.device_mesh is not None:
       assert p.weight_split_dims_mapping is not None
+      assert p.activation_split_dims_mapping is not None
 
     def ProjectInput():
       return p.proj_tpl.Copy().Set(
@@ -566,8 +567,8 @@ class MultiHeadedAttention(base_layer.BaseLayer):
         # The 2nd part of the softamx --- scaling.
         encoded = encoded / tf.transpose(probs_sum, [0, 2, 1, 3])
 
-    encoded = xla_sharding_utils.MeshSplit(encoded, p.device_mesh,
-                                           p.activation_split_dims_mapping.blnh)
+    encoded = gshard_utils.MeshSplit(encoded, p.device_mesh,
+                                     p.activation_split_dims_mapping.blnh)
     return encoded, probs
 
   def _FavorDotAtten(self,
@@ -578,7 +579,8 @@ class MultiHeadedAttention(base_layer.BaseLayer):
                      paddings,
                      segment_mask,
                      per_step_padding=None,
-                     favor_config=None):
+                     favor_config=None,
+                     redraw=False):
     """Main FAVOR attention function from Rethinking Attention with Performers.
 
     Args:
@@ -595,6 +597,7 @@ class MultiHeadedAttention(base_layer.BaseLayer):
         information flow from future (causal padding). It has shape [B, T, S] if
         not None.
       favor_config: dictionary defining parameters of FAVOR attention.
+      redraw: whether kernel features should be redrawn (N/A if not random).
 
     Returns:
       encoded: [B, T, N, H].
@@ -614,8 +617,12 @@ class MultiHeadedAttention(base_layer.BaseLayer):
       kernel_transformation = favor.softmax_kernel_transformation
       # TODO(kchoro): Add the option of redrawing projection matrices. This
       # improves in several applications.
+      if redraw:
+        seed = None
+      else:
+        seed = 0
       projection_matrix = favor.create_projection_matrix(
-          num_random_features, query.shape[-1])
+          num_random_features, query.shape[-1], seed=seed)
       encoded = favor.favor_attention(query, key, value, kernel_transformation,
                                       False, projection_matrix)
     else:
@@ -801,12 +808,12 @@ class MultiHeadedAttention(base_layer.BaseLayer):
               [d, 1, dh])
       value_proj = tf.einsum('BTD,DNH->BTNH', value_vec, rhs)
 
-    query_proj = xla_sharding_utils.MeshSplit(
-        query_proj, p.device_mesh, p.activation_split_dims_mapping.blnh)
-    key_proj = xla_sharding_utils.MeshSplit(
-        key_proj, p.device_mesh, p.activation_split_dims_mapping.blnh)
-    value_proj = xla_sharding_utils.MeshSplit(
-        value_proj, p.device_mesh, p.activation_split_dims_mapping.blnh)
+    query_proj = gshard_utils.MeshSplit(query_proj, p.device_mesh,
+                                        p.activation_split_dims_mapping.blnh)
+    key_proj = gshard_utils.MeshSplit(key_proj, p.device_mesh,
+                                      p.activation_split_dims_mapping.blnh)
+    value_proj = gshard_utils.MeshSplit(value_proj, p.device_mesh,
+                                        p.activation_split_dims_mapping.blnh)
 
     if p.packed_input and not self.do_eval:
       assert segment_mask is not None
@@ -817,8 +824,8 @@ class MultiHeadedAttention(base_layer.BaseLayer):
     encoded = self.post.FProp(theta.post, encoded)
 
     # Shard the output
-    encoded = xla_sharding_utils.MeshSplit(encoded, p.device_mesh,
-                                           p.activation_split_dims_mapping.bld)
+    encoded = gshard_utils.MeshSplit(encoded, p.device_mesh,
+                                     p.activation_split_dims_mapping.bld)
     return encoded, atten_probs
 
   def InitStates(self, theta, target_batch_size, target_max_length):
@@ -3355,7 +3362,6 @@ class TransformerLayer(base_layer.BaseLayer):
   @classmethod
   def SetCanonicalShardingParams(cls, params):
     """Set up canonical SPMD sharding params."""
-    assert params.device_mesh.ndim >= 2
     params.tr_atten_tpl.atten_tpl.weight_split_dims_mapping = [0, 1, -1]
     params.tr_atten_tpl.atten_tpl.activation_split_dims_mapping.blnh = None
     params.tr_atten_tpl.atten_tpl.activation_split_dims_mapping.bld = [
@@ -3884,7 +3890,7 @@ class StackedTransformerLayers(base_layer.BaseLayer):
     assert p.num_layers > 0
     assert p.mdl_dim > 0
     assert p.hidden_dim > 0
-    assert p.num_atten_heads > 0
+    assert p.num_atten_heads > 0 or isinstance(p.num_atten_heads, list)
     assert 0.0 <= p.dropout_prob < 1.0
 
     if isinstance(p.transformer_layer_params_tpl, list):
@@ -4585,8 +4591,7 @@ class MeshSplitLayer(base_layer.BaseLayer):
       The tensor with annotation applied.
     """
     p = self.params
-    return xla_sharding_utils.MeshSplit(x, p.device_mesh,
-                                        p.tensor_split_dims_mapping)
+    return gshard_utils.MeshSplit(x, p.device_mesh, p.tensor_split_dims_mapping)
 
   @classmethod
   def FPropMeta(cls, p, x):
@@ -5299,19 +5304,19 @@ class LmBuilder(Builder):
     return p
 
   def _Var(self, name, weights):
-    return moe_layers.VarLayer.Params().Set(name=name, weights=weights)
+    return gshard_layers.VarLayer.Params().Set(name=name, weights=weights)
 
   def _ShardedVar(self, name, weights, mesh_split):
     sharded_weights = []
     for k, v in weights:
       sharded_weights.append((k,
-                              moe_layers.ShardedWeightParams(
+                              gshard_layers.ShardedWeightParams(
                                   shape=v.shape,
                                   init=v.init,
                                   dtype=v.dtype,
                                   collections=v.collections,
                                   tensor_split_dims_mapping=mesh_split)))
-    return moe_layers.ShardedVarLayer.Params().Set(
+    return gshard_layers.ShardedVarLayer.Params().Set(
         name=name,
         weights=sharded_weights,
         device_mesh=self.params.device_mesh,

@@ -18,11 +18,12 @@
 import heapq
 import lingvo.compat as tf
 from lingvo.core import hyperparams
-from lingvo.core import py_utils
+from lingvo.core import nested_map
+from lingvo.core import thread_local_utils
 import numpy as np
 
 
-_CLUSTER_STACK = py_utils.ThreadLocalStack()
+_CLUSTER_STACK = thread_local_utils.ThreadLocalStack()
 
 
 class _Cluster:
@@ -337,33 +338,6 @@ class _Cluster:
   def all_worker_names(self):
     return [self._job_spec.name] + self._job_spec.additional_worker_names
 
-  def PlaceInput(self, input_params):
-    """Applies a placement policy on the given input generator params.
-
-    By default, the policy is to place the input generator onto the input
-    device. Subclass can override PlaceInput method to implement more advanced
-    placement policy.
-
-    Args:
-      input_params: An input generator params.
-
-    Returns:
-      An input params which places the input generator on the input device.
-    """
-
-    class _UseInputDevice(input_params.cls):
-      """Places the input generator on the input device."""
-
-      def __init__(self, params):
-        with tf.device(self.cluster.input_device):
-          super().__init__(params)
-
-      def SplitInputBatch(self, num_splits):
-        with tf.device(self.cluster.input_device):
-          return super().SplitInputBatch(num_splits)
-
-    return input_params.Copy().Set(cls=_UseInputDevice)
-
   @property
   def input_targets(self):
     """Returns a list of network addresses of the input job."""
@@ -535,7 +509,7 @@ def ParseDeviceString(device_str):
     parsed_device: a NestedMap that maps job, replica, task, and device to their
       corresponding value.
   """
-  parsed_device = py_utils.NestedMap()
+  parsed_device = nested_map.NestedMap()
   device_parts = device_str.split('/')
   for device_part in device_parts:
     if device_part.startswith('job:'):

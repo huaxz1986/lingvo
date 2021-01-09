@@ -264,6 +264,7 @@ py_library(
         ":py_utils",
         ":tokenizers",
         "//lingvo:compat",
+        "//lingvo/core:input_policy",
         "//lingvo/core/ops",
         # Implicit tensorflow dependency.
     ],
@@ -426,9 +427,9 @@ py_library(
         ":schedule",
         ":summary_utils",
         ":task_scheduler",
-        "//lingvo/core:decoder_lib",
         # Implicit model_pruning.pruning dependency.
         "//lingvo:compat",
+        "//lingvo/core:decoder_lib",
     ],
 )
 
@@ -571,9 +572,7 @@ py_library(
     name = "cluster_factory",
     srcs = ["cluster_factory.py"],
     srcs_version = "PY3",
-    deps = [
-        "//lingvo/core:cluster",
-    ],
+    deps = ["//lingvo/core:cluster"],
 )
 
 py_test(
@@ -1269,9 +1268,11 @@ py_library(
     deps = [
         ":gshard_utils",
         ":hyperparams",
+        ":nested_map",
         ":py_utils_flags",
         ":retry",
         ":symbolic",
+        ":thread_local_utils",
         ":tshape",
         "//lingvo:compat",
         "//lingvo/core/ops",
@@ -2323,5 +2324,31 @@ py_test(
         "//lingvo:compat",
         "//lingvo/core:builder_layers",
         "//lingvo/core:test_utils",
+    ],
+)
+
+py_library(
+    name = "input_policy",
+    srcs = ["input_policy.py"],
+    srcs_version = "PY3",
+    deps = [
+        "//lingvo:compat",
+    ],
+)
+
+py_library(
+    name = "thread_local_utils",
+    srcs = ["thread_local_utils.py"],
+    srcs_version = "PY3",
+    deps = [
+    ],
+)
+
+py_library(
+    name = "nested_map",
+    srcs = ["nested_map.py"],
+    srcs_version = "PY3",
+    deps = [
+        "//lingvo:compat",
     ],
 )

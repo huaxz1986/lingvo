@@ -583,6 +583,7 @@ py_test(
     python_version = "PY3",
     srcs_version = "PY3",
     deps = [
+        ":cluster",
         ":cluster_factory",
         ":test_utils",
         "//lingvo:compat",
@@ -1804,6 +1805,15 @@ py_test(
         ":tokenizers",
         "//lingvo:compat",
         # Implicit numpy dependency.
+    ],
+)
+
+py_library(
+    name = "routing_config_helper",
+    srcs = ["routing_config_helper.py"],
+    srcs_version = "PY3",
+    deps = [
+        "//lingvo/core:batch_major_attention",
     ],
 )
 

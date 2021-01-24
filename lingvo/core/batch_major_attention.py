@@ -256,6 +256,7 @@ class MultiHeadedProjectionLayer(base_layer.BaseLayer):
     """
     p = self.params
     with tf.name_scope(p.name):
+      inputs = self._CastToFPropDtype(inputs)
       if p.make_output_proj_no_op:
         return inputs
       if p.is_output_projection:
@@ -772,18 +773,22 @@ class MultiHeadedAttention(base_layer.BaseLayer):
     if not atten_dim:
       atten_dim = p.input_dim
     dim_per_head = atten_dim // num_heads
+    # empty() is not supported for bfloat16 on CPU.
+    dtype = py_utils.FPropDtype(p)
+    if dtype == tf.bfloat16 and not py_utils.use_tpu():
+      dtype = tf.float32
     # TODO(shafey): Determine if we want to make the cached shape 128 to
     # avoid padding and more efficient interpolation in beamsearch.
     return py_utils.NestedMap(
         key=inplace_ops.empty(
             shape=(target_max_length, target_batch_size, num_heads,
                    dim_per_head),
-            dtype=py_utils.FPropDtype(p),
+            dtype=dtype,
             init=True),
         value=inplace_ops.empty(
             shape=(target_max_length, target_batch_size, num_heads,
                    dim_per_head),
-            dtype=py_utils.FPropDtype(p),
+            dtype=dtype,
             init=True))
 
   def ExtendStep(self,
@@ -839,21 +844,26 @@ class MultiHeadedAttention(base_layer.BaseLayer):
     query_proj = self.query.FProp(theta.query, query_vec)
 
     # Using a if condtion, in case it's more efficient to update the same index.
+    new_key_proj = tf.cast(
+        tf.reshape(new_key_proj, [b, n, h]), dtype=cached_states.key.dtype)
+    new_value_proj = tf.cast(
+        tf.reshape(new_value_proj, [b, n, h]), dtype=cached_states.value.dtype)
     if synced_time_step:
       # The extended_key and extended_value have shape [T, B, N, H].
-      extended_key = inplace_ops.alias_inplace_update(
-          cached_states.key, time_step, tf.reshape(new_key_proj, [b, n, h]))
-      extended_value = inplace_ops.alias_inplace_update(
-          cached_states.value, time_step, tf.reshape(new_value_proj, [b, n, h]))
+      extended_key = inplace_ops.alias_inplace_update(cached_states.key,
+                                                      time_step, new_key_proj)
+      extended_value = inplace_ops.alias_inplace_update(cached_states.value,
+                                                        time_step,
+                                                        new_value_proj)
     else:
       # The extended_key and extended_value have shape [T, B, N, H].
       selected_indices = tf.range(b) + time_step * b
       extended_key = inplace_ops.alias_inplace_update(
           tf.reshape(cached_states.key, [-1, n, h]), selected_indices,
-          tf.reshape(new_key_proj, [b, n, h]))
+          new_key_proj)
       extended_value = inplace_ops.alias_inplace_update(
           tf.reshape(cached_states.value, [-1, n, h]), selected_indices,
-          tf.reshape(new_value_proj, [b, n, h]))
+          new_value_proj)
       extended_key = tf.reshape(extended_key, [t, b, n, h])
       extended_value = tf.reshape(extended_value, [t, b, n, h])
     updated_state = py_utils.NestedMap(key=extended_key, value=extended_value)
@@ -864,8 +874,8 @@ class MultiHeadedAttention(base_layer.BaseLayer):
     encoded = self._DotAttenOneStep(
         theta,
         query_proj,
-        extended_key,
-        extended_value,
+        self._CastToFPropDtype(extended_key),
+        self._CastToFPropDtype(extended_value),
         paddings,
         segment_mask,
         per_step_padding,
@@ -1419,6 +1429,10 @@ class LocalSelfAttention(MultiHeadedAttention):
   def _AttenLogits(self, theta, query, key):
     return tf.einsum('BUTNH,BUSNH->BNUTS', query, key)
 
+  def _StreamAttenLogits(self, theta, query_proj, key):
+    # [B, Q, N, T]
+    return tf.einsum('BQNH,BTNH->BQNT', query_proj, key)
+
   def AttenProbs(self,
                  theta,
                  query,
@@ -1745,6 +1759,10 @@ class LocalSelfAttention(MultiHeadedAttention):
     masks = tf.zeros([batch_size, context_len], py_utils.FPropDtype(p))
     return py_utils.NestedMap(key=key_state, value=value_state, masks=masks)
 
+  def IsInferenceStepStatic(self):
+    p = self.params
+    return p.inference_step_max_length is not None and p.inference_step_max_length > 0
+
   def StreamStep(self, theta, query_vec, paddings, state0):
     """Computes the value vector given the query of the current step.
 
@@ -1766,8 +1784,7 @@ class LocalSelfAttention(MultiHeadedAttention):
     assert p.enable_value_proj, 'Value projection must be enabled.'
     assert p.right_context == 0, ('StreamStep() does not support look ahead.')
 
-    if (p.inference_step_max_length is not None and
-        p.inference_step_max_length > 0):
+    if self.IsInferenceStepStatic():
       return self._StreamStepStaticLength(theta, query_vec, paddings, state0)
     else:
       return self._StreamStepDynamicLength(theta, query_vec, paddings, state0)
@@ -1865,7 +1882,7 @@ class LocalSelfAttention(MultiHeadedAttention):
         new_masks = tf.concat([state0.masks, 1 - paddings], axis=1)[:, -s:]
 
       # [B, Q, N, T]
-      logits = tf.einsum('BQNH,BTNH->BQNT', query_proj, key)
+      logits = self._StreamAttenLogits(theta, query_proj, key)
 
       very_negative_logits = tf.constant(-0.7 * logits.dtype.max, logits.dtype)
 
@@ -1956,7 +1973,7 @@ class LocalSelfAttention(MultiHeadedAttention):
       t = py_utils.GetShape(state_paddings)[1]
 
       # [B, Q, N, T]
-      logits = tf.einsum('BQNH,BTNH->BQNT', query_proj, key)
+      logits = self._StreamAttenLogits(theta, query_proj, key)
 
       very_negative_logits = tf.constant(-0.7 * logits.dtype.max, logits.dtype)
 
@@ -2029,6 +2046,10 @@ class LocalSelfAttentionXL(LocalSelfAttention):
     params = self.params
     if params.rel_pos_emb_dim is None or params.rel_pos_emb_dim <= 0:
       raise ValueError('Invalid rel_pos_emb_dim: %s' % params.rel_pos_emb_dim)
+
+    if params.use_3d_recurrent_state:
+      # Rel pos emb relies on the shape of query and key.
+      raise ValueError('Rel pos emb does not support 3d recurrent state.')
 
     emb_params = layers.PositionalEmbeddingLayer.Params().Set(
         embedding_dim=params.rel_pos_emb_dim)
@@ -2112,6 +2133,15 @@ class LocalSelfAttentionXL(LocalSelfAttention):
       term_bd = tf.reshape(term_d, [1, n, 1, w, c])
     return term_ac + term_bd
 
+  def _StreamAttenLogits(self, theta, query, key):
+    # BQNH -> BUQNH
+    query = tf.expand_dims(query, 1)
+    # BTNH -> BUSNH
+    key = tf.expand_dims(key, 1)
+    logits = self._AttenLogits(theta, query, key)
+    # BNUQT -> BNQT -> BQNT
+    return tf.transpose(tf.squeeze(logits, 2), [0, 2, 1, 3])
+
   def _AttenLogitsOneStep(self, theta, query, key, time_step):
     """Attention logits for one single target (query) step.
 
@@ -2162,11 +2192,32 @@ class LocalSelfAttentionXL(LocalSelfAttention):
                  use_short_seq_opt=False):
     raise NotImplementedError
 
-  def zero_state(self, batch_size):
-    raise NotImplementedError
-
   def StreamStep(self, theta, query_vec, paddings, state0):
-    raise NotImplementedError
+    """Computes the value vector given the query of the current step.
+
+    Note: Rel pos emb relies on the shape of key. It expects the seq length
+    of key is 'q.length + left - 1'. See '_AttenLogits()'.
+    'p.inference_step_max_length' must be same to 'q.length', when
+    'p.inference_step_max_length > 0'.
+
+    Args:
+      theta: A NestedMap of layer params.
+      query_vec: A query vector of shape [B, Q, D].
+      paddings: A 0/1 valued tensor of shape [B, Q].
+      state0: A NestedMap of the same structure as returned by zero_state().
+
+    Returns:
+      output: Output of the given query vector with shape [B, Q, D].
+      padding: the same as input paddings.
+      state1: Updated state of the same structure as state0.
+    """
+    if self.IsInferenceStepStatic():
+      p = self.params
+      _, q = py_utils.GetShape(query_vec, 2)
+      # Rel pos emb expects the seq length of key is `q.length + left - 1`.
+      assert q == p.inference_step_max_length, (
+          'inference_step_max_length must be same to the seq length of query.')
+    return super().StreamStep(theta, query_vec, paddings, state0)
 
 
 class RoutingAttention(MultiHeadedAttention):
@@ -2971,6 +3022,13 @@ class TransformerAttentionLayer(base_layer.BaseLayer):
       p.atten_tpl.Set(left_context=left_context, right_context=right_context)
     return p
 
+  @classmethod
+  def SetFPropDtype(cls, p, fprop_dtype):
+    p.fprop_dtype = fprop_dtype
+    if fprop_dtype == tf.bfloat16:
+      p.ln_tpl.fprop_dtype = tf.float32
+    return p
+
   def _InitAttentionParams(self, atten_tpl):
     """Returns an initialized transformer attention parameters."""
     p = self.params
@@ -3082,12 +3140,19 @@ class TransformerAttentionLayer(base_layer.BaseLayer):
       atten_probs: [B, N, T, S].
     """
     p = self.params
+
+    (query_vec, source_vecs, paddings, per_step_padding_override,
+     segment_mask) = self._CastToFPropDtype(
+         (query_vec, source_vecs, paddings, per_step_padding_override,
+          segment_mask))
+
     b, t, _ = py_utils.GetShape(query_vec, 3)
     unnormalized_query_vec = query_vec
 
     # Layer normalization.
     if p.ln_tpl:
       query_vec = self.layer_norm.FProp(theta.layer_norm, query_vec)
+      query_vec = self._CastToFPropDtype(query_vec)
 
     # For self-attention: keys = queries.
     if source_vecs is None:
@@ -3182,6 +3247,7 @@ class TransformerAttentionLayer(base_layer.BaseLayer):
       ValueError: If not used as masked/causal self-attention.
     """
     p = self.params
+    query_vec = self._CastToFPropDtype(query_vec)
     if not p.is_masked:
       raise ValueError(
           'ExtendStep should be used only by masked/causal self-attention.')
@@ -3211,6 +3277,7 @@ class TransformerAttentionLayer(base_layer.BaseLayer):
     # Layer normalization.
     if p.ln_tpl:
       query_vec = self.layer_norm.FProp(theta.layer_norm, query_vec)
+      query_vec = self._CastToFPropDtype(query_vec)
 
     # Multiheaded masked/causal self-attention.
     def _AttenExtendStep(atten, theta, cached_states):
@@ -3271,10 +3338,12 @@ class TransformerAttentionLayer(base_layer.BaseLayer):
     p = self.params
     assert p.is_masked
     with tf.name_scope(f'{p.name}/StreamStep'):
+      query_vec, paddings = self._CastToFPropDtype((query_vec, paddings))
       unnormalized_query_vec = query_vec
 
       if p.ln_tpl:
         query_vec = self.layer_norm.FProp(self.theta.layer_norm, query_vec)
+        query_vec = self._CastToFPropDtype(query_vec)
 
       output, paddings, atten_state1 = self.atten.StreamStep(
           theta.atten, query_vec, paddings, state0.atten)
@@ -3383,6 +3452,14 @@ class TransformerLayer(base_layer.BaseLayer):
     params.tr_fflayer_tpl.fflayer_tpl.activation_split_dims_mapping_list = [[
         0, -1, 1
     ], [1, -1, -1]]
+
+  @classmethod
+  def SetFPropDtype(cls, p, fprop_dtype):
+    p.fprop_dtype = fprop_dtype
+    for sub_p in (p.tr_atten_tpl, p.tr_self_atten_tpl, p.tr_fflayer_tpl):
+      if sub_p is not None:
+        sub_p.cls.SetFPropDtype(sub_p, fprop_dtype)
+    return p
 
   @classmethod
   def CommonParams(cls,

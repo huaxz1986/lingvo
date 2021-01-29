@@ -119,6 +119,55 @@ class MultiHeadSelfAttentionTest(test_utils.TestCase, parameterized.TestCase):
     expected_prob_out = np.reshape(expected_prob_out, (6, 6, 6))
     self.assertAllClose(expected_prob_out, prob_out)
 
+  @parameterized.named_parameters(('Two', 2), ('Three', 3))
+  def testMultiHeadedProjectionLayerInputMode(self, batch_dims):
+    with self.session(use_gpu=True) as sess:
+      batch_sizes = list(np.arange(3, 3 + batch_dims))
+
+      num_heads, dim_per_head = 4, 2
+      model_dims = num_heads * dim_per_head
+
+      input_tf = tf.random.normal(
+          shape=batch_sizes + [model_dims], dtype=tf.float32)
+      proj_p = attention.MultiHeadedProjectionLayer.Params().Set(
+          input_dim=model_dims,
+          num_heads=num_heads,
+          dim_per_head=dim_per_head,
+          is_output_projection=False,
+          name='proj')
+
+      proj = proj_p.Instantiate()
+      tf.global_variables_initializer().run()
+      result = proj.FPropDefaultTheta(input_tf)
+      result_np = sess.run(result)
+      self.assertEqual(result_np.shape,
+                       tuple(batch_sizes + [num_heads, dim_per_head]))
+
+  @parameterized.named_parameters(('Two', 2), ('Three', 3))
+  def testMultiHeadedProjectionLayerOutputMode(self, batch_dims):
+    with self.session(use_gpu=True) as sess:
+      batch_sizes = list(np.arange(3, 3 + batch_dims))
+
+      num_heads, dim_per_head = 4, 2
+      model_dims = num_heads * dim_per_head
+
+      input_tf = tf.random.normal(
+          shape=batch_sizes + [num_heads, dim_per_head], dtype=tf.float32)
+
+      proj_p = attention.MultiHeadedProjectionLayer.Params().Set(
+          input_dim=model_dims,
+          num_heads=num_heads,
+          dim_per_head=dim_per_head,
+          is_output_projection=True,
+          name='proj')
+
+      proj = proj_p.Instantiate()
+      tf.global_variables_initializer().run()
+      result = proj.FPropDefaultTheta(input_tf)
+      result_np = sess.run(result)
+
+      self.assertEqual(result_np.shape, tuple(batch_sizes + [model_dims]))
+
   def testMultiHeadedAttentionDotProduct(self):
     # input_batch:6, seq_len:6. Test n = 2 case.
     with self.session(use_gpu=True) as sess:
@@ -2422,6 +2471,39 @@ class TransformerLayerTest(test_utils.TestCase, parameterized.TestCase):
           2.8200178, 5.659971, 4.3814187, 2.60475
       ] * multiplier
       self.assertAllClose(expected_ctx, np.sum(actual_ctx, axis=1))
+
+  def testReshapedTransformerLayerFPropNoCrossAttention(self):
+    with self.session(use_gpu=True) as sess:
+      query_vec, _, _, _ = self._TransformerAttentionLayerInputs()
+      paddings = tf.zeros([2, 5])
+      # default setup
+      p = attention.TransformerLayer.Params()
+      p.name = 'transformer_layer'
+      p.has_aux_atten = False
+      p.input_dim = 4
+      p.tr_fflayer_tpl.hidden_dim = 7
+      p.tr_atten_tpl.num_heads = 2
+      p.params_init = py_utils.WeightInit.Xavier(scale=1.0, seed=0)
+      l = p.Instantiate()
+      ctx_vec, _ = l.FProp(l.theta, query_vec, paddings)
+      # reshaped setup
+      reshaped_p = p.Copy()
+      attention.TransformerLayer.SetReshapedLayers(reshaped_p)
+      reshaped_p.device_mesh = np.reshape(np.arange(4), [2, 2])
+      attention.TransformerLayer.SetCanonicalShardingParams(
+          reshaped_p, reshape_dim=True)
+      reshaped_p.name = 'reshaped_transformer_layer'
+      reshaped_l = reshaped_p.Instantiate()
+      # Use l.theta as it is compatible with reshaped_l.
+      reshaped_ctx_vec, _ = reshaped_l.FProp(
+          l.theta, tf.reshape(query_vec, [2, 5, 2, 2]), paddings)
+
+      tf.global_variables_initializer().run()
+      actual_ctx = sess.run(ctx_vec)
+      actual_ctx = np.reshape(actual_ctx, (2, 5, 4))
+      reshaped_ctx = sess.run(reshaped_ctx_vec)
+      reshaped_ctx = np.reshape(reshaped_ctx, (2, 5, 4))
+      self.assertAllClose(actual_ctx, reshaped_ctx)
 
   @parameterized.named_parameters(('SingleBatch', 1), ('DoubleBatch', 2))
   def testMultiSourceTransformerLayerFPropWithCrossAttention(self, multiplier):

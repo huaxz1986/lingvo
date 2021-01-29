@@ -23,6 +23,7 @@
 
 import bisect
 import math
+import string
 from absl import logging
 from lingvo import compat as tf
 from lingvo.core import attention_util
@@ -137,15 +138,17 @@ class PerDimScaleLayer(base_layer.BaseLayer):
 
     Args:
       theta: weights defined in this layer.
-      inputs: 4D tensor with shape [..., p.dim]
+      inputs: A tensor with shape [..., p.dim].
 
     Returns:
-      outpus: 4D tensor with shape [..., p.dim]
+      outpus: A tensor with shape [..., p.dim].
     """
     p = self.params
     with tf.name_scope(p.name):
       dim = symbolic.ToStatic(p.dim)
-      inputs = py_utils.HasShape(inputs, [-1, -1, -1, dim])
+      expected_shape = tf.concat([py_utils.GetShape(inputs)[:-1], [dim]],
+                                 axis=0)
+      inputs = py_utils.HasShape(inputs, expected_shape)
 
       # 1.0/tf.nn.softplus(0.0) = 1.442695041. Hard code this number so that we
       # can avoid unnecessary XLA op fusion mess on TPU.
@@ -183,8 +186,8 @@ class MultiHeadedProjectionLayer(base_layer.BaseLayer):
     p.Define(
         'is_output_projection', False,
         'Whether it is out projection or not. If False, we use '
-        '"BTD,DNH->BTNH" for query,key,value projection. Otherwise we use '
-        '"BTNH,DNH->BTD" for output projection.')
+        '"...D,DNH->...NH" for query,key,value projection. Otherwise we use '
+        '"...NH,DNH->...D" for output projection.')
     p.Define(
         'make_output_proj_no_op', False, 'If True no output projection is '
         'applied. This should be set with is_output_projection True and will '
@@ -247,28 +250,84 @@ class MultiHeadedProjectionLayer(base_layer.BaseLayer):
     Args:
       theta: A `.NestedMap` object containing weights' values of this layer and
         its children layers.
-      inputs: A tensor of shape [batch_size, time_steps, num_heads,
-        dim_per_head] or [batch_size, time_steps, hidden_size].
+      inputs: A tensor of shape [..., num_heads, dim_per_head] or [...,
+        hidden_size].
 
     Returns:
-      The projected tensor with shape [[batch_size, time_steps, hidden_size] or
-      [batch_size, time_steps, num_heads, dim_per_head].
+      The projected tensor with shape [..., hidden_size] or
+      [..., num_heads, dim_per_head].
     """
+
+    # Because tf.einsum is not fully optimized unless all the dimensions are
+    # fully specified, we have to avoid using '...' for batch dimensions in the
+    # equation in tf.einsum for optimized performance. This is only feasible
+    # when the rank of the tensor is known.
+    eqn_sym = ''.join(set(string.ascii_uppercase) - set('DHN'))
+    shape = py_utils.GetShape(inputs)
+    rank = None if isinstance(shape, tf.Tensor) else len(shape)
+
     p = self.params
     with tf.name_scope(p.name):
       inputs = self._CastToFPropDtype(inputs)
       if p.make_output_proj_no_op:
         return inputs
+
+      if p.is_output_projection:
+        expected_shape = tf.concat(
+            [py_utils.GetShape(inputs)[:-2], [p.num_heads, p.dim_per_head]],
+            axis=0)
+        inputs = py_utils.HasShape(inputs, expected_shape)
+        batch_eqn = eqn_sym[:(rank - 2)] if rank else '...'
+        eqn = f'{batch_eqn}NH,DNH->{batch_eqn}D'
+      else:
+        expected_shape = tf.concat(
+            [py_utils.GetShape(inputs)[:-1], [p.input_dim]], axis=0)
+        inputs = py_utils.HasShape(inputs, expected_shape)
+        batch_eqn = eqn_sym[:(rank - 1)] if rank else '...'
+        eqn = f'{batch_eqn}D,DNH->{batch_eqn}NH'
+      ret = tf.einsum(eqn, inputs, theta.w)
+      if p.use_bias:
+        ret += theta.b
+      return ret
+
+
+# TODO(shibow/wangtao) remove this after b/174094694 is done.
+class ReshapedMultiHeadedProjectionLayer(MultiHeadedProjectionLayer):
+  """MultiHeadedProjectionLayer with model dim D reshaped as Md."""
+
+  def FProp(self, theta, inputs):
+    """Computes the multi headed projection for inputs.
+
+    Args:
+      theta: A `.NestedMap` object containing weights' values of this layer and
+        its children layers.
+      inputs: A tensor of shape [batch_size, time_steps, num_heads,
+        dim_per_head] or [batch_size, time_steps, dim_reshape_segments,
+        hidden_size // dim_reshape_segments].
+
+    Returns:
+      The projected tensor with shape [batch_size, time_steps,
+      dim_reshape_segments, hidden_size // dim_reshape_segments] or
+      [batch_size, time_steps, num_heads, dim_per_head].
+    """
+    p = self.params
+    assert p.device_mesh is not None
+    assert p.device_mesh.ndim >= 2
+    with tf.name_scope(p.name):
+      inputs = self._CastToFPropDtype(inputs)
+      if p.make_output_proj_no_op:
+        return inputs
+      theta.w = gshard_utils.ReshapeDim(theta.w, 0, p.device_mesh.shape[1])
       if p.is_output_projection:
         inputs = py_utils.HasShape(
             inputs, [-1, -1, p.num_heads,
                      symbolic.ToStatic(p.dim_per_head)])
-        ret = tf.einsum('BTNH,DNH->BTD', inputs, theta.w)
+        ret = tf.einsum('BTNH,MdNH->BTMd', inputs, theta.w)
       else:
-        inputs = py_utils.HasShape(
-            inputs, [-1, -1, symbolic.ToStatic(p.input_dim)])
-        ret = tf.einsum('BTD,DNH->BTNH', inputs, theta.w)
+        ret = tf.einsum('BTMd,MdNH->BTNH', inputs, theta.w)
       if p.use_bias:
+        if p.is_output_projection:
+          theta.b = gshard_utils.ReshapeDim(theta.b, 0, p.device_mesh.shape[1])
         ret += theta.b
       return ret
 
@@ -966,6 +1025,18 @@ class MultiHeadedFavorAttention(MultiHeadedAttention):
           p.num_random_features, query.shape[-1], None if p.redraw else 0)
       encoded = favor.favor_attention(query, key, value, kernel_transformation,
                                       False, projection_matrix)
+    elif p.attention_type == 'cossim':
+      projection_matrix = favor.create_projection_matrix(
+          p.num_random_features, query.shape[-1], None if p.redraw else 0)
+      key_prime = favor.cossim_kernel_transformation(key, False,
+                                                     projection_matrix, 0.0,
+                                                     p.num_random_features)
+      query_prime = favor.cossim_kernel_transformation(query, True,
+                                                       projection_matrix, 0.0,
+                                                       p.num_random_features)
+      attention_scores = tf.einsum('BXHD,BYHD->BXYH', query_prime, key_prime)
+      attention_scores = tf.nn.softmax(attention_scores, axis=2)
+      encoded = tf.einsum('BXYH,BYHD->BXHD', attention_scores, value)
     else:
       logging.info(
           'FAVOR attention type: %s is not supported,returning query tensor.',
@@ -3438,18 +3509,46 @@ class TransformerLayer(base_layer.BaseLayer):
     return p
 
   @classmethod
-  def SetCanonicalShardingParams(cls, params):
-    """Set up canonical SPMD sharding params."""
+  def SetCanonicalShardingParams(cls, params, reshape_dim=False):
+    """Set up canonical SPMD sharding params.
+
+    The topology is required to written as 2D. For 1D sharding, the topology is
+    expected to be written as [1, num_partitions]. The split_dims_mappings
+    specify how weights and activations are sharded in the corresponding layers.
+    fflayer has two projection layers(df/blf and fd/bld), so the
+    split_dims_mapping has higher rank to represent both projection layers one
+    after another.
+    For 1D sharding, better performance can be obtained by sharding activations
+    on batch dim, so bld is set to [1, -1, -1] and blnh to None (will be auto
+    propagated).
+    For 2D sharding, typical sharding is [0, -1, 1, -1] for blnh and [0, -1, 1]
+    for bld. If ReshapeDim trick is applied to model dim to remove the data
+    formatting overheads, the bld sharding annotation needs to be adpated as
+    [0, -1, 1, -1].
+
+    Args:
+      params: params of TransformerLayer.
+      reshape_dim: A bool, whether to reshape model dim.
+    """
+    # Weights
     params.tr_atten_tpl.atten_tpl.weight_split_dims_mapping = [0, 1, -1]
-    params.tr_atten_tpl.atten_tpl.activation_split_dims_mapping.blnh = None
-    params.tr_atten_tpl.atten_tpl.activation_split_dims_mapping.bld = [
-        1, -1, -1
-    ]
     params.tr_fflayer_tpl.fflayer_tpl.weight_split_dims_mapping_list = [[0, 1],
                                                                         [1, 0]]
-    params.tr_fflayer_tpl.fflayer_tpl.activation_split_dims_mapping_list = [[
-        0, -1, 1
-    ], [1, -1, -1]]
+    # Activations
+    params.tr_atten_tpl.atten_tpl.activation_split_dims_mapping.blnh = None
+    bld_split = [1, -1, -1]
+    blf_split = [0, -1, 1]
+    sharding_2d = (
+        params.device_mesh.shape[0] != 1 and params.device_mesh.shape[1] != 1)
+    if sharding_2d:
+      params.tr_atten_tpl.atten_tpl.activation_split_dims_mapping.blnh = [
+          0, -1, 1, -1
+      ]
+      bld_split = ([0, -1, 1, -1] if reshape_dim else [0, -1, 1])
+    params.tr_atten_tpl.atten_tpl.activation_split_dims_mapping.bld = bld_split
+    params.tr_fflayer_tpl.fflayer_tpl.activation_split_dims_mapping_list = [
+        blf_split, bld_split
+    ]
 
   @classmethod
   def SetFPropDtype(cls, p, fprop_dtype):
@@ -3458,6 +3557,31 @@ class TransformerLayer(base_layer.BaseLayer):
       if sub_p is not None:
         sub_p.cls.SetFPropDtype(sub_p, fprop_dtype)
     return p
+
+  @classmethod
+  def SetReshapedLayers(cls, params):
+
+    def _CopyParams(old_params, new_params):
+      old_params_dict = dict(old_params.IterParams())
+      del old_params_dict['cls']
+      new_params.Set(**old_params_dict)
+
+    old_tr_fflayer_p = params.tr_fflayer_tpl
+    old_tr_fflayer_ln_p = params.tr_fflayer_tpl.ln_tpl
+    old_tr_atten_ln_p = params.tr_atten_tpl.ln_tpl
+    old_tr_atten_atten_proj_p = params.tr_atten_tpl.atten_tpl.proj_tpl
+
+    params.tr_fflayer_tpl = (
+        layers_with_attention.ReshapedTransformerFeedForwardLayer.Params())
+    _CopyParams(old_tr_fflayer_p, params.tr_fflayer_tpl)
+    params.tr_fflayer_tpl.ln_tpl = layers.ReshapedLayerNorm.Params()
+    _CopyParams(old_tr_fflayer_ln_p, params.tr_fflayer_tpl.ln_tpl)
+    params.tr_atten_tpl.ln_tpl = layers.ReshapedLayerNorm.Params()
+    _CopyParams(old_tr_atten_ln_p, params.tr_atten_tpl.ln_tpl)
+    params.tr_atten_tpl.atten_tpl.proj_tpl = (
+        ReshapedMultiHeadedProjectionLayer.Params())
+    _CopyParams(old_tr_atten_atten_proj_p,
+                params.tr_atten_tpl.atten_tpl.proj_tpl)
 
   @classmethod
   def CommonParams(cls,
@@ -4384,7 +4508,11 @@ class PaddingLayer(base_layer.BaseLayer):
     Returns:
       Tensor with paddings applied.
     """
-    return py_utils.ApplyPadding(tf.expand_dims(paddings, -1), inputs)
+    paddings = tf.expand_dims(paddings, -1)
+    if inputs.shape.ndims is not None and paddings.shape.ndims is not None:
+      for _ in range(py_utils.GetRank(inputs) - py_utils.GetRank(paddings)):
+        paddings = tf.expand_dims(paddings, -1)
+    return py_utils.ApplyPadding(paddings, inputs)
 
   @classmethod
   def FPropMeta(cls, p, inputs, paddings):
